@@ -135,7 +135,7 @@ fn parse_taskset(taskset: &str) -> Result<Vec<usize>, String> {
 #[serde(deny_unknown_fields)]
 pub struct ConfigGrpc {
     /// Address of Grpc service.
-    pub address: SocketAddr,
+    pub address: ListenEndpoint,
     /// TLS config
     pub tls_config: Option<ConfigGrpcServerTls>,
     /// Possible compression options
@@ -353,4 +353,33 @@ pub enum ListenEndpoint {
     Tcp(std::net::SocketAddr),
     #[cfg(unix)]
     Unix(std::path::PathBuf),
+}
+
+impl FromStr for ListenEndpoint {
+    type Err = anyhow::Error;
+
+    /// Rules:
+    /// * `"unix:/abs/path.sock"`  →  Unix(PathBuf)
+    /// * everything else          →  Tcp(SocketAddr)
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if cfg!(unix) && s.starts_with("unix:") {
+            Ok(ListenEndpoint::Unix(s["unix:".len()..].into()))
+        } else {
+            Ok(ListenEndpoint::Tcp(
+                s.parse()
+                    .with_context(|| format!("invalid socket address: {s}"))?,
+            ))
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ListenEndpoint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Read the TOML/YAML/JSON value as a string, then delegate to `FromStr`.
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(de::Error::custom)
+    }
 }
