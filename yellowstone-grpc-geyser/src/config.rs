@@ -348,3 +348,9 @@ where
         None => Ok(None),
     }
 }
+
+pub enum ListenEndpoint {
+    Tcp(std::net::SocketAddr),
+    #[cfg(unix)]
+    Unix(std::path::PathBuf),
+}

@@ -58,6 +58,15 @@ use {
     },
 };
 
+#[cfg(unix)]
+use {
+    hyper::server::accept::from_stream,
+    hyper_util::rt::TokioIo,
+    std::path::Path,
+    tokio::net::UnixListener,
+    tokio_stream::{wrappers::UnixListenerStream, StreamExt},
+};
+
 #[derive(Debug)]
 struct BlockhashStatus {
     slot: u64,
@@ -357,12 +366,29 @@ impl GrpcService {
         Arc<Notify>,
     )> {
         // Bind service address
-        let incoming = TcpIncoming::new(
-            config.address,
-            true,                          // tcp_nodelay
-            Some(Duration::from_secs(20)), // tcp_keepalive
-        )
-        .map_err(|error| anyhow::anyhow!(error))?;
+        let incoming = match &config.endpoint {
+            ListenEndpoint::Tcp(addr) => TcpIncoming::new(
+                *addr,
+                true,                          // tcp_nodelay
+                Some(Duration::from_secs(20)), // tcp_keepalive
+            )
+            .map_err(|error| anyhow::anyhow!(error))?,
+
+            #[cfg(unix)]
+            ListenEndpoint::Unix(path) => {
+                // remove stale socket file on reloads
+                if path.exists() && !is_reload {
+                    std::fs::remove_file(path)?;
+                }
+
+                let uds = UnixListener::bind(path)
+                    .with_context(|| format!("failed to bind unix socket {path:?}"))?;
+
+                let stream = UnixListenerStream::new(uds).map_ok(|st| TokioIo::new(st));
+
+                from_stream(stream)
+            }
+        };
 
         // Snapshot channel
         let (snapshot_tx, snapshot_rx) = match config.snapshot_plugin_channel_capacity {
