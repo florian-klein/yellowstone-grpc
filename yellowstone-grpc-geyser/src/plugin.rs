@@ -290,7 +290,7 @@ impl GeyserPlugin for Plugin {
     }
 
     fn account_data_notifications_enabled(&self) -> bool {
-        true
+        false
     }
 
     fn account_data_snapshot_notifications_enabled(&self) -> bool {
@@ -302,7 +302,7 @@ impl GeyserPlugin for Plugin {
     }
 
     fn entry_notifications_enabled(&self) -> bool {
-        true
+        false
     }
 }
 
