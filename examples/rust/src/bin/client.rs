@@ -21,22 +21,26 @@ use {
     },
     tokio::{fs, sync::Mutex},
     tonic::transport::{channel::ClientTlsConfig, Certificate},
-    yellowstone_grpc_client::{GeyserGrpcClient, GeyserGrpcClientError, Interceptor},
+    yellowstone_grpc_client::{
+        GeyserGrpcBuilder, GeyserGrpcClient, GeyserGrpcClientError, Interceptor,
+    },
+    yellowstone_grpc_geyser::plugin::{convert_from, filter::message::FilteredUpdate},
     yellowstone_grpc_proto::{
-        convert_from,
         geyser::SlotStatus,
-        plugin::filter::message::FilteredUpdate,
         prelude::{
             subscribe_request_filter_accounts_filter::Filter as AccountsFilterOneof,
             subscribe_request_filter_accounts_filter_lamports::Cmp as AccountsFilterLamports,
             subscribe_request_filter_accounts_filter_memcmp::Data as AccountsFilterMemcmpOneof,
-            subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
-            SubscribeRequestAccountsDataSlice, SubscribeRequestFilterAccounts,
-            SubscribeRequestFilterAccountsFilter, SubscribeRequestFilterAccountsFilterLamports,
+            subscribe_update::UpdateOneof,
+            subscribe_update_deshred::UpdateOneof as DeshredUpdateOneof, CommitmentLevel,
+            SubscribeDeshredRequest, SubscribeRequest, SubscribeRequestAccountsDataSlice,
+            SubscribeRequestFilterAccounts, SubscribeRequestFilterAccountsFilter,
+            SubscribeRequestFilterAccountsFilterLamports,
             SubscribeRequestFilterAccountsFilterMemcmp, SubscribeRequestFilterBlocks,
-            SubscribeRequestFilterBlocksMeta, SubscribeRequestFilterEntry,
-            SubscribeRequestFilterSlots, SubscribeRequestFilterTransactions, SubscribeRequestPing,
-            SubscribeUpdateAccountInfo, SubscribeUpdateEntry, SubscribeUpdateTransactionInfo,
+            SubscribeRequestFilterBlocksMeta, SubscribeRequestFilterDeshredTransactions,
+            SubscribeRequestFilterEntry, SubscribeRequestFilterSlots,
+            SubscribeRequestFilterTransactions, SubscribeRequestPing, SubscribeUpdateAccountInfo,
+            SubscribeUpdateEntry, SubscribeUpdateTransactionInfo,
         },
         prost::Message,
     },
@@ -49,6 +53,7 @@ type TransactionsStatusFilterMap = HashMap<String, SubscribeRequestFilterTransac
 type EntryFilterMap = HashMap<String, SubscribeRequestFilterEntry>;
 type BlocksFilterMap = HashMap<String, SubscribeRequestFilterBlocks>;
 type BlocksMetaFilterMap = HashMap<String, SubscribeRequestFilterBlocksMeta>;
+type DeshredTransactionsFilterMap = HashMap<String, SubscribeRequestFilterDeshredTransactions>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Compression {
@@ -85,6 +90,10 @@ struct Args {
     /// Apply a timeout to connecting to the uri.
     #[clap(long)]
     connect_timeout_ms: Option<u64>,
+
+    /// Connect via Unix Domain Socket at this path instead of TCP
+    #[clap(long)]
+    uds: Option<PathBuf>,
 
     /// Sets the tower service default internal buffer size, default is 1024
     #[clap(long)]
@@ -147,7 +156,7 @@ impl Args {
         Some(self.commitment.unwrap_or_default().into())
     }
 
-    async fn connect(&self) -> anyhow::Result<GeyserGrpcClient<impl Interceptor + Clone>> {
+    async fn build(&self) -> anyhow::Result<GeyserGrpcBuilder> {
         let mut tls_config = ClientTlsConfig::new().with_native_roots();
         if let Some(path) = &self.ca_certificate {
             let bytes = fs::read(path).await?;
@@ -203,7 +212,7 @@ impl Args {
             builder = builder.timeout(Duration::from_millis(duration));
         }
 
-        builder.connect().await.map_err(Into::into)
+        Ok(builder)
     }
 }
 
@@ -230,6 +239,7 @@ enum Action {
     HealthCheck,
     HealthWatch,
     Subscribe(Box<ActionSubscribe>),
+    SubscribeDeshred(Box<ActionSubscribeDeshred>),
     SubscribeReplayInfo,
     Ping {
         #[clap(long, short, default_value_t = 0)]
@@ -401,6 +411,34 @@ struct ActionSubscribe {
     /// Verify manually implemented encoding against prost
     #[clap(long, default_value_t = false)]
     verify_encoding: bool,
+}
+
+/// Subscribe on deshred transactions (pre-execution)
+#[derive(Debug, Clone, clap::Args)]
+struct ActionSubscribeDeshred {
+    /// Filter vote transactions
+    #[clap(long)]
+    vote: Option<bool>,
+
+    /// Filter by account keys (include) - matches static + ALT-loaded addresses
+    #[clap(long)]
+    account_include: Vec<String>,
+
+    /// Filter by account keys (exclude) - matches static + ALT-loaded addresses
+    #[clap(long)]
+    account_exclude: Vec<String>,
+
+    /// Filter by required account keys - all must be present (static or ALT-loaded)
+    #[clap(long)]
+    account_required: Vec<String>,
+
+    /// Send ping in subscribe request
+    #[clap(long)]
+    ping: Option<i32>,
+
+    /// Show total stat instead of messages
+    #[clap(long, default_value_t = false)]
+    stats: bool,
 }
 
 impl Action {
@@ -590,6 +628,99 @@ impl Action {
             _ => None,
         })
     }
+
+    fn get_subscribe_deshred_request(&self) -> Option<(SubscribeDeshredRequest, bool)> {
+        match self {
+            Self::SubscribeDeshred(args) => {
+                let mut deshred_transactions: DeshredTransactionsFilterMap = HashMap::new();
+                deshred_transactions.insert(
+                    "client".to_string(),
+                    SubscribeRequestFilterDeshredTransactions {
+                        vote: args.vote,
+                        account_include: args.account_include.clone(),
+                        account_exclude: args.account_exclude.clone(),
+                        account_required: args.account_required.clone(),
+                    },
+                );
+
+                let ping = args.ping.map(|id| SubscribeRequestPing { id });
+
+                Some((
+                    SubscribeDeshredRequest {
+                        deshred_transactions,
+                        ping,
+                    },
+                    args.stats,
+                ))
+            }
+            _ => None,
+        }
+    }
+}
+
+async fn run_action(
+    mut client: GeyserGrpcClient<impl Interceptor>,
+    action: &Action,
+    commitment: Option<CommitmentLevel>,
+) -> anyhow::Result<()> {
+    match action {
+        Action::HealthCheck => client
+            .health_check()
+            .await
+            .map_err(anyhow::Error::new)
+            .map(|response| info!("response: {response:?}")),
+        Action::HealthWatch => geyser_health_watch(client).await,
+        Action::Subscribe(_) => {
+            let (request, resub, stats, verify_encoding) = action
+                .get_subscribe_request(commitment)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("expect subscribe action"))?;
+
+            geyser_subscribe(client, request, resub, stats, verify_encoding).await
+        }
+        Action::SubscribeDeshred(_) => {
+            let (request, stats) = action
+                .get_subscribe_deshred_request()
+                .ok_or_else(|| anyhow::anyhow!("expect subscribe deshred action"))?;
+
+            geyser_subscribe_deshred(client, request, stats).await
+        }
+        Action::SubscribeReplayInfo => client
+            .subscribe_replay_info()
+            .await
+            .map_err(anyhow::Error::new)
+            .map(|response| info!("response: {response:?}")),
+        Action::Ping { count } => client
+            .ping(*count)
+            .await
+            .map_err(anyhow::Error::new)
+            .map(|response| info!("response: {response:?}")),
+        Action::GetLatestBlockhash => client
+            .get_latest_blockhash(commitment)
+            .await
+            .map_err(anyhow::Error::new)
+            .map(|response| info!("response: {response:?}")),
+        Action::GetBlockHeight => client
+            .get_block_height(commitment)
+            .await
+            .map_err(anyhow::Error::new)
+            .map(|response| info!("response: {response:?}")),
+        Action::GetSlot => client
+            .get_slot(commitment)
+            .await
+            .map_err(anyhow::Error::new)
+            .map(|response| info!("response: {response:?}")),
+        Action::IsBlockhashValid { blockhash } => client
+            .is_blockhash_valid(blockhash.clone(), commitment)
+            .await
+            .map_err(anyhow::Error::new)
+            .map(|response| info!("response: {response:?}")),
+        Action::GetVersion => client
+            .get_version()
+            .await
+            .map_err(anyhow::Error::new)
+            .map(|response| info!("response: {response:?}")),
+    }
 }
 
 #[tokio::main]
@@ -620,65 +751,29 @@ async fn main() -> anyhow::Result<()> {
             drop(zero_attempts);
 
             let commitment = args.get_commitment();
-            let mut client = args.connect().await.map_err(backoff::Error::transient)?;
-            info!("Connected");
+            let builder = args.build().await.map_err(backoff::Error::transient)?;
 
-            match &args.action {
-                Action::HealthCheck => client
-                    .health_check()
+            if let Some(uds_path) = &args.uds {
+                let client = builder
+                    .connect_uds(uds_path)
                     .await
                     .map_err(anyhow::Error::new)
-                    .map(|response| info!("response: {response:?}")),
-                Action::HealthWatch => geyser_health_watch(client).await,
-                Action::Subscribe(_) => {
-                    let (request, resub, stats, verify_encoding) = args
-                        .action
-                        .get_subscribe_request(commitment)
-                        .await
-                        .map_err(backoff::Error::Permanent)?
-                        .ok_or(backoff::Error::Permanent(anyhow::anyhow!(
-                            "expect subscribe action"
-                        )))?;
-
-                    geyser_subscribe(client, request, resub, stats, verify_encoding).await
-                }
-                Action::SubscribeReplayInfo => client
-                    .subscribe_replay_info()
+                    .map_err(backoff::Error::transient)?;
+                info!("Connected");
+                run_action(client, &args.action, commitment)
+                    .await
+                    .map_err(backoff::Error::transient)?;
+            } else {
+                let client = builder
+                    .connect()
                     .await
                     .map_err(anyhow::Error::new)
-                    .map(|response| info!("response: {response:?}")),
-                Action::Ping { count } => client
-                    .ping(*count)
+                    .map_err(backoff::Error::transient)?;
+                info!("Connected");
+                run_action(client, &args.action, commitment)
                     .await
-                    .map_err(anyhow::Error::new)
-                    .map(|response| info!("response: {response:?}")),
-                Action::GetLatestBlockhash => client
-                    .get_latest_blockhash(commitment)
-                    .await
-                    .map_err(anyhow::Error::new)
-                    .map(|response| info!("response: {response:?}")),
-                Action::GetBlockHeight => client
-                    .get_block_height(commitment)
-                    .await
-                    .map_err(anyhow::Error::new)
-                    .map(|response| info!("response: {response:?}")),
-                Action::GetSlot => client
-                    .get_slot(commitment)
-                    .await
-                    .map_err(anyhow::Error::new)
-                    .map(|response| info!("response: {response:?}")),
-                Action::IsBlockhashValid { blockhash } => client
-                    .is_blockhash_valid(blockhash.clone(), commitment)
-                    .await
-                    .map_err(anyhow::Error::new)
-                    .map(|response| info!("response: {response:?}")),
-                Action::GetVersion => client
-                    .get_version()
-                    .await
-                    .map_err(anyhow::Error::new)
-                    .map(|response| info!("response: {response:?}")),
+                    .map_err(backoff::Error::transient)?;
             }
-            .map_err(backoff::Error::transient)?;
 
             Ok::<(), backoff::Error<anyhow::Error>>(())
         }
@@ -957,6 +1052,106 @@ async fn geyser_subscribe(
         }
     }
     info!("stream closed");
+    Ok(())
+}
+
+async fn geyser_subscribe_deshred(
+    mut client: GeyserGrpcClient<impl Interceptor>,
+    request: SubscribeDeshredRequest,
+    stats: bool,
+) -> anyhow::Result<()> {
+    let pb_multi = MultiProgress::new();
+    let mut pb_txs_c = 0;
+    let pb_txs = crate_progress_bar(&pb_multi, ProgressBarTpl::Msg("deshred transactions"))?;
+    let mut pb_pp_c = 0;
+    let pb_pp = crate_progress_bar(&pb_multi, ProgressBarTpl::Msg("ping/pong"))?;
+    let mut pb_total_c = 0;
+    let pb_total = crate_progress_bar(&pb_multi, ProgressBarTpl::Total)?;
+
+    let (mut subscribe_tx, mut stream) =
+        client.subscribe_deshred_with_request(Some(request)).await?;
+
+    info!("deshred stream opened");
+    while let Some(message) = stream.next().await {
+        match message {
+            Ok(msg) => {
+                if stats {
+                    let encoded_len = msg.encoded_len() as u64;
+                    let (pb_c, pb) = match msg.update_oneof {
+                        Some(DeshredUpdateOneof::DeshredTransaction(_)) => (&mut pb_txs_c, &pb_txs),
+                        Some(DeshredUpdateOneof::Ping(_)) => (&mut pb_pp_c, &pb_pp),
+                        Some(DeshredUpdateOneof::Pong(_)) => (&mut pb_pp_c, &pb_pp),
+                        None => {
+                            pb_multi.println("update not found in the deshred message")?;
+                            break;
+                        }
+                    };
+                    *pb_c += 1;
+                    pb.set_message(format_thousands(*pb_c));
+                    pb.inc(encoded_len);
+                    pb_total_c += 1;
+                    pb_total.set_message(format_thousands(pb_total_c));
+                    pb_total.inc(encoded_len);
+
+                    continue;
+                }
+
+                let filters = msg.filters;
+                let created_at: SystemTime = msg
+                    .created_at
+                    .ok_or(anyhow::anyhow!("no created_at in the message"))?
+                    .try_into()
+                    .context("failed to parse created_at")?;
+                match msg.update_oneof {
+                    Some(DeshredUpdateOneof::DeshredTransaction(msg)) => {
+                        let tx = msg
+                            .transaction
+                            .ok_or(anyhow::anyhow!("no transaction in the message"))?;
+                        let loaded_writable: Vec<String> = tx
+                            .loaded_writable_addresses
+                            .iter()
+                            .map(|addr| bs58::encode(addr).into_string())
+                            .collect();
+                        let loaded_readonly: Vec<String> = tx
+                            .loaded_readonly_addresses
+                            .iter()
+                            .map(|addr| bs58::encode(addr).into_string())
+                            .collect();
+                        print_update(
+                            "deshredTransaction",
+                            created_at,
+                            &filters,
+                            json!({
+                                "slot": msg.slot,
+                                "signature": Signature::try_from(tx.signature.as_slice()).context("invalid signature")?.to_string(),
+                                "isVote": tx.is_vote,
+                                "loadedWritableAddresses": loaded_writable,
+                                "loadedReadonlyAddresses": loaded_readonly,
+                            }),
+                        );
+                    }
+                    Some(DeshredUpdateOneof::Ping(_)) => {
+                        subscribe_tx
+                            .send(SubscribeDeshredRequest {
+                                ping: Some(SubscribeRequestPing { id: 1 }),
+                                ..Default::default()
+                            })
+                            .await?;
+                    }
+                    Some(DeshredUpdateOneof::Pong(_)) => {}
+                    None => {
+                        error!("update not found in the deshred message");
+                        break;
+                    }
+                }
+            }
+            Err(error) => {
+                error!("error: {error:?}");
+                break;
+            }
+        }
+    }
+    info!("deshred stream closed");
     Ok(())
 }
 

@@ -1,14 +1,6 @@
-#[cfg(feature = "account-data-as-bytes")]
-use bytes::Bytes;
 use {
     crate::{
-        geyser::{
-            subscribe_update::UpdateOneof, SlotStatus as SlotStatusProto, SubscribeUpdate,
-            SubscribeUpdateAccount, SubscribeUpdateAccountInfo, SubscribeUpdateBlock,
-            SubscribeUpdateEntry, SubscribeUpdatePing, SubscribeUpdatePong, SubscribeUpdateSlot,
-            SubscribeUpdateTransaction, SubscribeUpdateTransactionInfo,
-            SubscribeUpdateTransactionStatus,
-        },
+        metrics,
         plugin::{
             filter::{name::FilterName, FilterAccountsDataSlice},
             message::{
@@ -16,9 +8,11 @@ use {
                 MessageSlot, MessageTransaction, MessageTransactionInfo,
             },
         },
-        solana::storage::confirmed_block,
     },
-    bytes::buf::{Buf, BufMut},
+    bytes::{
+        buf::{Buf, BufMut},
+        Bytes,
+    },
     prost::{
         encoding::{
             encode_key, encode_varint, encoded_len_varint, key_len, message, DecodeContext,
@@ -32,8 +26,18 @@ use {
     std::{
         collections::HashSet,
         ops::{Deref, DerefMut},
-        sync::Arc,
+        sync::{Arc, OnceLock},
         time::SystemTime,
+    },
+    yellowstone_grpc_proto::{
+        geyser::{
+            subscribe_update::UpdateOneof, SlotStatus as SlotStatusProto, SubscribeUpdate,
+            SubscribeUpdateAccount, SubscribeUpdateAccountInfo, SubscribeUpdateBlock,
+            SubscribeUpdateEntry, SubscribeUpdatePing, SubscribeUpdatePong, SubscribeUpdateSlot,
+            SubscribeUpdateTransaction, SubscribeUpdateTransactionInfo,
+            SubscribeUpdateTransactionStatus,
+        },
+        solana::storage::confirmed_block,
     },
 };
 
@@ -138,10 +142,7 @@ impl FilteredUpdate {
             owner: message.owner.as_ref().into(),
             executable: message.executable,
             rent_epoch: message.rent_epoch,
-            #[cfg(feature = "account-data-as-bytes")]
             data: Bytes::from(data_slice),
-            #[cfg(not(feature = "account-data-as-bytes"))]
-            data: data_slice,
             write_version: message.write_version,
             txn_signature: message.txn_signature.map(|s| s.as_ref().into()),
         }
@@ -288,7 +289,7 @@ impl FilteredUpdate {
                         },
                         index: msg.index as usize,
                         account_keys: HashSet::new(),
-                        pre_encoded: None,
+                        pre_encoded: OnceLock::new(),
                     }),
                     slot: msg.slot,
                 })
@@ -494,11 +495,13 @@ impl FilteredUpdateAccount {
         // use pre-encoded if: no slicing and pre-encoded exists
         if data_slice.as_ref().is_empty() {
             if let Some(pre_encoded) = account.get_pre_encoded() {
+                metrics::pre_encoded_cache_hit("account");
                 encode_key(tag, WireType::LengthDelimited, buf);
                 encode_varint(pre_encoded.len() as u64, buf);
                 buf.put_slice(pre_encoded);
                 return;
             }
+            metrics::pre_encoded_cache_miss("account");
         }
 
         // fallback: slice-aware encoding
@@ -683,11 +686,14 @@ impl FilteredUpdateTransaction {
     fn tx_encode_raw(tag: u32, tx: &MessageTransactionInfo, buf: &mut impl BufMut) {
         // try to use pre-encoded bytes (fast path)
         if let Some(pre_encoded) = tx.get_pre_encoded() {
+            metrics::pre_encoded_cache_hit("txn");
             encode_key(tag, WireType::LengthDelimited, buf);
             encode_varint(pre_encoded.len() as u64, buf);
             buf.put_slice(pre_encoded);
             return;
         }
+
+        metrics::pre_encoded_cache_miss("txn");
 
         // fallback: encode from scratch
         encode_key(tag, WireType::LengthDelimited, buf);
@@ -1014,26 +1020,21 @@ impl FilteredUpdateEntry {
     }
 }
 
-#[cfg(any(test, feature = "plugin-bench"))]
+#[cfg(any(test, feature = "bench"))]
 pub mod tests {
-    #![cfg_attr(feature = "plugin-bench", allow(dead_code))]
-    #![cfg_attr(feature = "plugin-bench", allow(unused_imports))]
     use {
         super::{FilteredUpdate, FilteredUpdateBlock, FilteredUpdateFilters, FilteredUpdateOneof},
-        crate::{
+        crate::plugin::{
             convert_to,
-            geyser::{SubscribeUpdate, SubscribeUpdateBlockMeta},
-            plugin::{
-                filter::{
-                    encoder::{AccountEncoder, TransactionEncoder},
-                    message::{FilteredUpdateAccount, FilteredUpdateTransaction},
-                    name::FilterName,
-                    FilterAccountsDataSlice,
-                },
-                message::{
-                    MessageAccount, MessageAccountInfo, MessageBlockMeta, MessageEntry,
-                    MessageSlot, MessageTransaction, MessageTransactionInfo, SlotStatus,
-                },
+            filter::{
+                encoder::{AccountEncoder, TransactionEncoder},
+                message::{FilteredUpdateAccount, FilteredUpdateTransaction},
+                name::FilterName,
+                FilterAccountsDataSlice,
+            },
+            message::{
+                MessageAccount, MessageAccountInfo, MessageBlockMeta, MessageEntry, MessageSlot,
+                MessageTransaction, MessageTransactionInfo, SlotStatus,
             },
         },
         bytes::Bytes,
@@ -1050,9 +1051,10 @@ pub mod tests {
             fs,
             ops::Range,
             str::FromStr,
-            sync::Arc,
+            sync::{Arc, OnceLock},
             time::SystemTime,
         },
+        yellowstone_grpc_proto::geyser::{SubscribeUpdate, SubscribeUpdateBlockMeta},
     };
 
     pub fn create_message_filters(names: &[&str]) -> FilteredUpdateFilters {
@@ -1103,7 +1105,7 @@ pub mod tests {
                                     data: Bytes::from(data.clone()),
                                     write_version,
                                     txn_signature,
-                                    pre_encoded: None,
+                                    pre_encoded: OnceLock::new(),
                                 }));
                             }
                         }
@@ -1211,7 +1213,7 @@ pub mod tests {
                             meta: convert_to::create_transaction_meta(&tx.meta),
                             index,
                             account_keys: HashSet::new(),
-                            pre_encoded: None,
+                            pre_encoded: OnceLock::new(),
                         }
                     })
                     .map(Arc::new)
@@ -1321,7 +1323,7 @@ pub mod tests {
                                             data: Bytes::from(data.clone()),
                                             write_version,
                                             txn_signature,
-                                            pre_encoded: None,
+                                            pre_encoded: OnceLock::new(),
                                         };
                                         AccountEncoder::pre_encode(&mut account_with);
 
@@ -1335,7 +1337,7 @@ pub mod tests {
                                             data: Bytes::from(data.clone()),
                                             write_version,
                                             txn_signature,
-                                            pre_encoded: None,
+                                            pre_encoded: OnceLock::new(),
                                         };
 
                                         // Encode both using FilteredUpdateAccount (no slicing)
@@ -1429,7 +1431,7 @@ pub mod tests {
                 meta: tx_arc.meta.clone(),
                 index: tx_arc.index,
                 account_keys: tx_arc.account_keys.clone(),
-                pre_encoded: None,
+                pre_encoded: OnceLock::new(),
             };
 
             // Create version without cache (fallback path)
@@ -1440,14 +1442,14 @@ pub mod tests {
                 meta: tx_arc.meta.clone(),
                 index: tx_arc.index,
                 account_keys: tx_arc.account_keys.clone(),
-                pre_encoded: None,
+                pre_encoded: OnceLock::new(),
             };
 
             // Pre-encode one of them
             TransactionEncoder::pre_encode(&mut tx_with_cache);
 
             assert!(
-                tx_with_cache.pre_encoded.is_some(),
+                tx_with_cache.pre_encoded.get().is_some(),
                 "pre_encode should populate the field"
             );
 

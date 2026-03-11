@@ -10,11 +10,79 @@ The minor version will be incremented upon a breaking change and the patch versi
 
 ## [Unreleased]
 
+### Features
+- geyser: add Unix domain socket support for multiple gRPC listener ([#671](https://github.com/rpcpool/yellowstone-grpc/pull/671))
+- client: add `connect_uds` method for Unix domain socket connections ([#671](https://github.com/rpcpool/yellowstone-grpc/pull/671))
+- client-simple: add `--uds` flag for Unix domain socket connections ([#671](https://github.com/rpcpool/yellowstone-grpc/pull/671))
+
+- geyser: configurable per-subscriber subscription limit with enforce/observe mode ([#680](https://github.com/rpcpool/yellowstone-grpc/pull/680))
+
+## 2026-02-24
+
+- yellowstone-grpc-client-12.1.0
+- yellowstone-grpc-client-simple-12.1.0
+- yellowstone-grpc-geyser-12.1.0
+- yellowstone-grpc-proto-12.1.0
+
 ### Fixes
+- geyser: replace Arc::get_mut with OnceLock for pre-encoding to support shared ownership, added metrics for pre-encode hit/miss ([#683](https://github.com/rpcpool/yellowstone-grpc/pull/683))
+
+- geyser: replace `OnDrop` with `ClientSession` RAII guard in `client_loop`, fixing missed cleanup on early-exit paths ([#687](https://github.com/rpcpool/yellowstone-grpc/pull/687)), ([#690](https://github.com/rpcpool/yellowstone-grpc/pull/690))
+- geyser: fix ping and traffic metric ([#698](https://github.com/rpcpool/yellowstone-grpc/pull/698))
+- geyser: revert encoding optimization commits ([#696](https://github.com/rpcpool/yellowstone-grpc/pull/696))
 
 ### Features
 
+- proto: add `SubscribeDeshred` RPC with dedicated `SubscribeUpdateDeshred` response type, deshred transaction messages with loaded addresses (ALT) ([#684](https://github.com/rpcpool/yellowstone-grpc/pull/684))
+- client: add `subscribe_deshred`, `subscribe_deshred_with_request`, `subscribe_deshred_once` methods returning `SubscribeUpdateDeshred` stream ([#684](https://github.com/rpcpool/yellowstone-grpc/pull/684))
+- geyser: add `SubscribeDeshred` stub (returns `unimplemented` on non-triton-ext servers) ([#684](https://github.com/rpcpool/yellowstone-grpc/pull/684))
+- geyser: spy incoming connections ([#697](https://github.com/rpcpool/yellowstone-grpc/pull/697))
+- geyser: implemented metered traffic tracking ([#699](https://github.com/rpcpool/yellowstone-grpc/pull/699))
+
 ### Breaking
+
+## 2026-02-06
+
+- yellowstone-grpc-client-12.0.0
+- yellowstone-grpc-client-simple-12.0.0
+- yellowstone-grpc-geyser-12.0.0
+- yellowstone-grpc-proto-12.0.0
+
+### Features
+
+- geyser: move plugin module from proto to geyser crate, removing all Solana dependencies from proto ([#675](https://github.com/rpcpool/yellowstone-grpc/pull/675))
+
+### Breaking
+
+- proto: removed `convert`, `plugin`, and `plugin-bench` features, these modules now live in `yellowstone-grpc-geyser` ([#675](https://github.com/rpcpool/yellowstone-grpc/pull/675))
+
+## 2026-02-05
+
+- yellowstone-grpc-client-11.1.0
+- yellowstone-grpc-client-simple-11.1.0
+- yellowstone-grpc-geyser-11.1.0
+- yellowstone-grpc-proto-11.1.0
+
+### Features
+
+- proto: pre-encode account content to reduce serialization overhead ([#657](https://github.com/rpcpool/yellowstone-grpc/pull/657))
+- proto: pre-encode transaction content to reduce serialization overhead ([#653](https://github.com/rpcpool/yellowstone-grpc/pull/653))
+- geyser: parallel encoding with Rayon threadpool and plugin lifecycle management ([#661](https://github.com/rpcpool/yellowstone-grpc/pull/661))
+
+## 2026-01-29
+
+- yellowstone-grpc-client-11.0.1
+- yellowstone-grpc-geyser-11.0.1
+- yellowstone-grpc-proto-11.0.1
+
+### Fixes
+
+- geyser: do not skip ping logic even if the channel is full ([#662](https://github.com/rpcpool/yellowstone-grpc/pull/662))
+- geyser: keep connection alive on client send half-close ([#670](https://github.com/rpcpool/yellowstone-grpc/pull/670))
+
+### Features
+
+- geyser: add client disconnect metrics ([#663](https://github.com/rpcpool/yellowstone-grpc/pull/663))
 
 ## 2026-01-20
 

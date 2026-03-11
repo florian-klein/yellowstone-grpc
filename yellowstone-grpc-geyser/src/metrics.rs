@@ -1,5 +1,9 @@
 use {
-    crate::{config::ConfigPrometheus, version::VERSION as VERSION_INFO},
+    crate::{
+        config::ConfigPrometheus,
+        plugin::{filter::Filter, message::SlotStatus},
+        version::VERSION as VERSION_INFO,
+    },
     agave_geyser_plugin_interface::geyser_plugin_interface::SlotStatus as GeyserSlosStatus,
     http_body_util::{combinators::BoxBody, BodyExt, Empty as BodyEmpty, Full as BodyFull},
     hyper::{
@@ -13,7 +17,8 @@ use {
     },
     log::{debug, error, info},
     prometheus::{
-        Histogram, HistogramOpts, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
+        Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
+        TextEncoder,
     },
     solana_clock::Slot,
     std::{
@@ -27,7 +32,6 @@ use {
         task::JoinHandle,
     },
     tokio_util::{sync::CancellationToken, task::TaskTracker},
-    yellowstone_grpc_proto::plugin::{filter::Filter, message::SlotStatus},
 };
 
 lazy_static::lazy_static! {
@@ -100,12 +104,12 @@ lazy_static::lazy_static! {
         &["subscriber_id"]
     ).unwrap();
 
-    static ref GRPC_SUBCRIBER_RX_LOAD: IntGaugeVec = IntGaugeVec::new(
+    static ref GRPC_CLIENT_DISCONNECTS: IntCounterVec = IntCounterVec::new(
         Opts::new(
-            "grpc_subscriber_recv_bandwidth_load",
-            "Current Receiver rate of subscriber channel (in bytes per second)"
+            "grpc_client_disconnects_total",
+            "Total client disconnections by reason"
         ),
-        &["subscriber_id"]
+        &["subscriber_id", "reason"]
     ).unwrap();
 
     static ref GEYSER_ACCOUNT_UPDATE_RECEIVED: Histogram = Histogram::with_opts(
@@ -114,6 +118,60 @@ lazy_static::lazy_static! {
             "Histogram of all account update data (kib) received from Geyser plugin"
         )
         .buckets(vec![5.0, 10.0, 20.0, 30.0, 50.0, 100.0, 200.0, 300.0, 500.0, 1000.0, 2000.0, 3000.0, 5000.0, 10000.0])
+    ).unwrap();
+
+    pub static ref GEYSER_BATCH_SIZE: Histogram = Histogram::with_opts(
+        HistogramOpts::new(
+            "yellowstone_geyser_batch_size",
+            "Size of processed message batches"
+        )
+        .buckets(vec![1.0, 4.0, 8.0, 16.0, 24.0, 31.0])
+    ).unwrap();
+
+    static ref PRE_ENCODED_CACHE_HIT: IntCounterVec = IntCounterVec::new(
+        Opts::new("yellowstone_grpc_pre_encoded_cache_hit", "Pre-encoded cache hits by message type"),
+        &["type"]
+    ).unwrap();
+
+    static ref PRE_ENCODED_CACHE_MISS: IntCounterVec = IntCounterVec::new(
+        Opts::new("yellowstone_grpc_pre_encoded_cache_miss", "Pre-encoded cache misses by message type"),
+        &["type"]
+    ).unwrap();
+
+    static ref GRPC_CONCURRENT_SUBSCRIBE_PER_TCP_CONNECTION: IntGaugeVec = IntGaugeVec::new(
+            Opts::new(
+                "grpc_concurrent_subscribe_per_tcp_connection",
+                "Current concurrent subscriptions per remote TCP peer socket address"
+            ),
+            &["remote_peer_sk_addr"]
+    ).unwrap();
+
+    static ref TOTAL_TRAFFIC_SENT: IntCounter = IntCounter::new(
+        "total_traffic_sent_bytes",
+        "Total traffic sent to subscriber by type (account_update, block_meta, etc)"
+    ).unwrap();
+
+    static ref TRAFFIC_SENT_PER_REMOTE_IP: IntCounterVec = IntCounterVec::new(
+        Opts::new("traffic_sent_per_remote_ip_bytes", "Total traffic sent to subscriber by remote IP"),
+        &["remote_ip"]
+    ).unwrap();
+
+    static ref GRPC_METHOD_CALL_COUNT: IntCounterVec = IntCounterVec::new(
+        Opts::new("yellowstone_grpc_method_call_count", "Total number of calls to GetVersion gRPC method"),
+        &["method"]
+    ).unwrap();
+
+    static ref GRPC_SUBSCRIPTION_LIMIT_EXCEEDED: IntCounterVec = IntCounterVec::new(
+        Opts::new(
+            "yellowstone_grpc_subscription_limit_exceeded_total",
+            "Number of subscribe attempts that exceeded the per-subscriber limit"
+        ),
+        &["subscriber_id"]
+    ).unwrap();
+
+    static ref GRPC_SERVICE_OUTBOUND_BYTES: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("yellowstone_grpc_service_outbound_bytes", "Current emitted bytes by tonic service response bodies per active subscriber stream"),
+        &["subscriber_id"]
     ).unwrap();
 }
 
@@ -264,8 +322,17 @@ impl PrometheusService {
             register!(GRPC_BYTES_SENT);
             register!(GEYSER_ACCOUNT_UPDATE_RECEIVED);
             register!(GRPC_SUBSCRIBER_SEND_BANDWIDTH_LOAD);
-            register!(GRPC_SUBCRIBER_RX_LOAD);
             register!(GRPC_SUBSCRIBER_QUEUE_SIZE);
+            register!(GEYSER_BATCH_SIZE);
+            register!(GRPC_CLIENT_DISCONNECTS);
+            register!(PRE_ENCODED_CACHE_HIT);
+            register!(PRE_ENCODED_CACHE_MISS);
+            register!(GRPC_CONCURRENT_SUBSCRIBE_PER_TCP_CONNECTION);
+            register!(TOTAL_TRAFFIC_SENT);
+            register!(TRAFFIC_SENT_PER_REMOTE_IP);
+            register!(GRPC_METHOD_CALL_COUNT);
+            register!(GRPC_SUBSCRIPTION_LIMIT_EXCEEDED);
+            register!(GRPC_SERVICE_OUTBOUND_BYTES);
 
             VERSION
                 .with_label_values(&[
@@ -434,6 +501,12 @@ pub fn connections_total_dec() {
     CONNECTIONS_TOTAL.dec()
 }
 
+pub fn subscription_limit_exceeded_inc<S: AsRef<str>>(subscriber_id: S) {
+    GRPC_SUBSCRIPTION_LIMIT_EXCEEDED
+        .with_label_values(&[subscriber_id.as_ref()])
+        .inc();
+}
+
 pub fn update_subscriptions(endpoint: &str, old: Option<&Filter>, new: Option<&Filter>) {
     for (multiplier, filter) in [(-1, old), (1, new)] {
         if let Some(filter) = filter {
@@ -466,16 +539,76 @@ pub fn set_subscriber_send_bandwidth_load<S: AsRef<str>>(subscriber_id: S, load:
         .set(load);
 }
 
-pub fn set_subscriber_recv_bandwidth_load<S: AsRef<str>>(subscriber_id: S, load: i64) {
-    GRPC_SUBCRIBER_RX_LOAD
-        .with_label_values(&[subscriber_id.as_ref()])
-        .set(load);
-}
-
 pub fn set_subscriber_queue_size<S: AsRef<str>>(subscriber_id: S, size: u64) {
     GRPC_SUBSCRIBER_QUEUE_SIZE
         .with_label_values(&[subscriber_id.as_ref()])
         .set(size as i64);
+}
+
+pub fn incr_client_disconnect<S: AsRef<str>>(subscriber_id: S, reason: &str) {
+    GRPC_CLIENT_DISCONNECTS
+        .with_label_values(&[subscriber_id.as_ref(), reason])
+        .inc();
+}
+
+pub fn pre_encoded_cache_hit(msg_type: &str) {
+    PRE_ENCODED_CACHE_HIT.with_label_values(&[msg_type]).inc();
+}
+
+pub fn pre_encoded_cache_miss(msg_type: &str) {
+    PRE_ENCODED_CACHE_MISS.with_label_values(&[msg_type]).inc();
+}
+
+pub fn incr_grpc_method_call_count<S: AsRef<str>>(method: S) {
+    GRPC_METHOD_CALL_COUNT
+        .with_label_values(&[method.as_ref()])
+        .inc();
+}
+
+pub fn add_grpc_service_outbound_bytes<S: AsRef<str>>(subscriber_id: S, bytes: u64) {
+    GRPC_SERVICE_OUTBOUND_BYTES
+        .with_label_values(&[subscriber_id.as_ref()])
+        .add(bytes as i64);
+}
+
+pub fn reset_grpc_service_outbound_bytes<S: AsRef<str>>(subscriber_id: S) {
+    GRPC_SERVICE_OUTBOUND_BYTES
+        .with_label_values(&[subscriber_id.as_ref()])
+        .set(0);
+}
+
+pub fn add_total_traffic_sent(bytes: u64) {
+    TOTAL_TRAFFIC_SENT.inc_by(bytes);
+}
+
+pub fn add_traffic_sent_per_remote_ip<S: AsRef<str>>(remote_ip: S, bytes: u64) {
+    TRAFFIC_SENT_PER_REMOTE_IP
+        .with_label_values(&[remote_ip.as_ref()])
+        .inc_by(bytes);
+}
+
+pub fn reset_traffic_sent_per_remote_ip<S: AsRef<str>>(remote_ip: S) {
+    TRAFFIC_SENT_PER_REMOTE_IP
+        .with_label_values(&[remote_ip.as_ref()])
+        .reset();
+    TRAFFIC_SENT_PER_REMOTE_IP
+        .remove_label_values(&[remote_ip.as_ref()])
+        .expect("remove_label_values");
+}
+
+pub fn set_grpc_concurrent_subscribe_per_tcp_connection<S: AsRef<str>>(
+    remote_peer_sk_addr: S,
+    size: u64,
+) {
+    GRPC_CONCURRENT_SUBSCRIBE_PER_TCP_CONNECTION
+        .with_label_values(&[remote_peer_sk_addr.as_ref()])
+        .set(size as i64);
+}
+
+pub fn remove_grpc_concurrent_subscribe_per_tcp_connection<S: AsRef<str>>(remote_peer_sk_addr: S) {
+    GRPC_CONCURRENT_SUBSCRIBE_PER_TCP_CONNECTION
+        .remove_label_values(&[remote_peer_sk_addr.as_ref()])
+        .expect("remove_label_values");
 }
 
 /// Reset all metrics on plugin unload to prevent metric accumulation across plugin lifecycle
@@ -491,12 +624,22 @@ pub fn reset_metrics() {
     INVALID_FULL_BLOCKS.reset();
     GRPC_SUBSCRIBER_SEND_BANDWIDTH_LOAD.reset();
     GRPC_SUBSCRIBER_QUEUE_SIZE.reset();
-    GRPC_SUBCRIBER_RX_LOAD.reset();
 
     // Reset counter vectors (clears all label combinations)
     MISSED_STATUS_MESSAGE.reset();
     GRPC_MESSAGE_SENT.reset();
     GRPC_BYTES_SENT.reset();
+    GRPC_CLIENT_DISCONNECTS.reset();
+    GRPC_CONCURRENT_SUBSCRIBE_PER_TCP_CONNECTION.reset();
+    TOTAL_TRAFFIC_SENT.reset();
+    TRAFFIC_SENT_PER_REMOTE_IP.reset();
+    GRPC_SERVICE_OUTBOUND_BYTES.reset();
+    GRPC_SUBSCRIPTION_LIMIT_EXCEEDED.reset();
+    GRPC_METHOD_CALL_COUNT.reset();
+
+    // Pre-encoding
+    PRE_ENCODED_CACHE_HIT.reset();
+    PRE_ENCODED_CACHE_MISS.reset();
 
     // Note: VERSION and GEYSER_ACCOUNT_UPDATE_RECEIVED are intentionally not reset
     // - VERSION contains build info set once on startup

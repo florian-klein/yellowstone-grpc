@@ -1,49 +1,12 @@
 use {
     crate::{
-        config::ConfigGrpc,
+        config::{ConfigGrpc, GrpcAddress},
+        metered::MeteredLayer,
         metrics::{
-            self, set_subscriber_queue_size, set_subscriber_recv_bandwidth_load,
-            set_subscriber_send_bandwidth_load, DebugClientMessage,
+            self, incr_grpc_method_call_count, set_subscriber_queue_size,
+            subscription_limit_exceeded_inc, DebugClientMessage, GEYSER_BATCH_SIZE,
         },
-        util::{
-            ema::{EmaReactivity, DEFAULT_EMA_WINDOW},
-            stream::{
-                load_aware_channel, LoadAwareReceiver, LoadAwareSender, StatsSettings,
-                TrafficWeighted,
-            },
-            sync::OnDrop,
-        },
-        version::GrpcVersionInfo,
-    },
-    anyhow::Context,
-    log::{error, info},
-    prost_types::Timestamp,
-    solana_clock::{Slot, MAX_RECENT_BLOCKHASHES},
-    solana_pubkey::Pubkey,
-    std::{
-        collections::{BTreeMap, HashMap},
-        sync::{
-            atomic::{AtomicU64, AtomicUsize, Ordering},
-            Arc,
-        },
-        time::SystemTime,
-    },
-    tokio::{
-        fs,
-        sync::{broadcast, mpsc, oneshot, Mutex, RwLock, Semaphore},
-        time::{sleep, Duration, Instant},
-    },
-    tokio_util::{sync::CancellationToken, task::TaskTracker},
-    tonic::{
-        service::interceptor,
-        transport::{
-            server::{Server, TcpIncoming},
-            Identity, ServerTlsConfig,
-        },
-        Request, Response, Result as TonicResult, Status, Streaming,
-    },
-    tonic_health::server::health_reporter,
-    yellowstone_grpc_proto::{
+        parallel::ParallelEncoder,
         plugin::{
             filter::{
                 limits::FilterLimits,
@@ -57,12 +20,52 @@ use {
             },
             proto::geyser_server::{Geyser, GeyserServer},
         },
+        transport::{SpyIncoming, SpyIncomingConfig, DEFAULT_TRAFFIC_REPORTING_THRESHOLD},
+        util::stream::{load_aware_channel, LoadAwareReceiver, LoadAwareSender},
+        version::GrpcVersionInfo,
+    },
+    anyhow::Context,
+    bytesize::ByteSize,
+    log::{error, info},
+    prost_types::Timestamp,
+    solana_clock::{Slot, MAX_RECENT_BLOCKHASHES},
+    solana_pubkey::Pubkey,
+    std::{
+        collections::{BTreeMap, HashMap},
+        net::SocketAddr,
+        os::unix::fs::PermissionsExt,
+        path::PathBuf,
+        sync::{
+            atomic::{AtomicU64, AtomicUsize, Ordering},
+            Arc, LazyLock, Mutex as StdMutex,
+        },
+        time::SystemTime,
+    },
+    tokio::{
+        fs,
+        net::UnixListener,
+        sync::{broadcast, mpsc, oneshot, Mutex, RwLock, Semaphore},
+        time::{sleep, Duration, Instant},
+    },
+    tokio_stream::wrappers::UnixListenerStream,
+    tokio_util::{sync::CancellationToken, task::TaskTracker},
+    tonic::{
+        metadata::AsciiMetadataValue,
+        service::interceptor,
+        transport::{
+            server::{Server, TcpConnectInfo, TcpIncoming, TlsConnectInfo},
+            Identity, ServerTlsConfig,
+        },
+        Request, Response, Result as TonicResult, Status, Streaming,
+    },
+    tonic_health::{pb::health_server::HealthServer, server::health_reporter},
+    yellowstone_grpc_proto::{
         prelude::{
             CommitmentLevel as CommitmentLevelProto, GetBlockHeightRequest, GetBlockHeightResponse,
             GetLatestBlockhashRequest, GetLatestBlockhashResponse, GetSlotRequest, GetSlotResponse,
             GetVersionRequest, GetVersionResponse, IsBlockhashValidRequest,
-            IsBlockhashValidResponse, PingRequest, PongResponse, SubscribeReplayInfoRequest,
-            SubscribeReplayInfoResponse, SubscribeRequest,
+            IsBlockhashValidResponse, PingRequest, PongResponse, SubscribeDeshredRequest,
+            SubscribeReplayInfoRequest, SubscribeReplayInfoResponse, SubscribeRequest,
         },
         prost::Message as ProstMessage,
     },
@@ -94,32 +97,6 @@ struct BlockMetaStorageInner {
     processed: Option<u64>,
     confirmed: Option<u64>,
     finalized: Option<u64>,
-}
-
-impl TrafficWeighted for FilteredUpdate {
-    fn weight(&self) -> u32 {
-        self.encoded_len() as u32
-    }
-}
-
-impl TrafficWeighted for Status {
-    fn weight(&self) -> u32 {
-        // Rough estimate of the size of a Status message, we don't really care about the exact size
-        self.message().len() as u32
-    }
-}
-
-impl<T, E> TrafficWeighted for Result<T, E>
-where
-    T: TrafficWeighted,
-    E: TrafficWeighted,
-{
-    fn weight(&self) -> u32 {
-        match self {
-            Ok(item) => item.weight(),
-            Err(err) => err.weight(),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -382,6 +359,12 @@ enum ReplayedResponse {
 
 type ReplayStoredSlotsRequest = (CommitmentLevel, Slot, oneshot::Sender<ReplayedResponse>);
 
+type SubscriptionTracker = Arc<StdMutex<HashMap<String, usize>>>;
+
+static CONCURRENT_SUBSCRIPTIONS_PER_REMOTE_PEER_SK_ADDR: LazyLock<
+    StdMutex<HashMap<SocketAddr, usize>>,
+> = LazyLock::new(|| StdMutex::new(HashMap::new()));
+
 #[derive(Debug, thiserror::Error)]
 enum ClientSnapshotReplayError {
     #[error("gRPC connection closed")]
@@ -390,14 +373,161 @@ enum ClientSnapshotReplayError {
     Cancelled,
 }
 
-#[derive(Debug)]
+struct ClientSession {
+    id: usize,
+    subscriber_id: String,
+    endpoint: String,
+    filter: Filter,
+    debug_client_tx: Option<mpsc::UnboundedSender<DebugClientMessage>>,
+    cancellation_token: CancellationToken,
+    disconnect_reason: &'static str,
+    maybe_remote_peer_sk_addr: Option<SocketAddr>,
+    subscription_tracker: SubscriptionTracker,
+}
+
+impl ClientSession {
+    fn new(
+        id: usize,
+        subscriber_id: Option<String>,
+        endpoint: String,
+        maybe_remote_peer_sk_addr: Option<SocketAddr>,
+        debug_client_tx: Option<mpsc::UnboundedSender<DebugClientMessage>>,
+        cancellation_token: CancellationToken,
+        subscription_tracker: SubscriptionTracker,
+    ) -> Self {
+        let filter = Filter::default();
+        let subscriber_id = subscriber_id.unwrap_or("UNKNOWN".to_owned());
+        if let Some(remote_peer_sk_addr) = maybe_remote_peer_sk_addr {
+            let mut subscriptions_per_remote_addr =
+                CONCURRENT_SUBSCRIPTIONS_PER_REMOTE_PEER_SK_ADDR
+                    .lock()
+                    .expect("CONCURRENT_SUBSCRIPTIONS_PER_REMOTE_PEER_SK_ADDR mutex poisoned");
+            let count = subscriptions_per_remote_addr
+                .entry(remote_peer_sk_addr)
+                .and_modify(|count| *count += 1)
+                .or_insert(1);
+            metrics::set_grpc_concurrent_subscribe_per_tcp_connection(
+                remote_peer_sk_addr.to_string(),
+                *count as u64,
+            );
+        }
+        metrics::update_subscriptions(&endpoint, None, Some(&filter));
+        DebugClientMessage::maybe_send(&debug_client_tx, || DebugClientMessage::UpdateFilter {
+            id,
+            filter: Box::new(filter.clone()),
+        });
+        info!("client #{id} ({subscriber_id}): new");
+        Self {
+            id,
+            subscriber_id,
+            endpoint,
+            filter,
+            debug_client_tx,
+            cancellation_token,
+            disconnect_reason: "unknown",
+            maybe_remote_peer_sk_addr,
+            subscription_tracker,
+        }
+    }
+
+    fn set_filter(&mut self, new_filter: Filter) {
+        metrics::update_subscriptions(&self.endpoint, Some(&self.filter), Some(&new_filter));
+        DebugClientMessage::maybe_send(&self.debug_client_tx, || {
+            DebugClientMessage::UpdateFilter {
+                id: self.id,
+                filter: Box::new(new_filter.clone()),
+            }
+        });
+        self.filter = new_filter;
+    }
+}
+
+impl Drop for ClientSession {
+    fn drop(&mut self) {
+        {
+            let mut tracker = self
+                .subscription_tracker
+                .lock()
+                .expect("subscription_tracker mutex poisoned");
+            if let Some(count) = tracker.get_mut(&self.subscriber_id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    tracker.remove(&self.subscriber_id);
+                }
+            }
+        }
+        if let Some(remote_peer_sk_addr) = self.maybe_remote_peer_sk_addr {
+            let mut subscriptions_per_remote_addr =
+                CONCURRENT_SUBSCRIPTIONS_PER_REMOTE_PEER_SK_ADDR
+                    .lock()
+                    .expect("CONCURRENT_SUBSCRIPTIONS_PER_REMOTE_PEER_SK_ADDR mutex poisoned");
+            if let Some(count) = subscriptions_per_remote_addr.get_mut(&remote_peer_sk_addr) {
+                if *count > 1 {
+                    *count -= 1;
+                    metrics::set_grpc_concurrent_subscribe_per_tcp_connection(
+                        remote_peer_sk_addr.to_string(),
+                        *count as u64,
+                    );
+                } else {
+                    subscriptions_per_remote_addr.remove(&remote_peer_sk_addr);
+                    metrics::set_grpc_concurrent_subscribe_per_tcp_connection(
+                        remote_peer_sk_addr.to_string(),
+                        0,
+                    );
+                    metrics::remove_grpc_concurrent_subscribe_per_tcp_connection(
+                        remote_peer_sk_addr.to_string(),
+                    );
+                }
+            }
+        }
+        set_subscriber_queue_size(&self.subscriber_id, 0);
+        metrics::incr_client_disconnect(&self.subscriber_id, self.disconnect_reason);
+        metrics::update_subscriptions(&self.endpoint, Some(&self.filter), None);
+        DebugClientMessage::maybe_send(&self.debug_client_tx, || DebugClientMessage::Removed {
+            id: self.id,
+        });
+        info!(
+            "client #{} ({}): removed ({})",
+            self.id, self.subscriber_id, self.disconnect_reason
+        );
+        self.cancellation_token.cancel();
+    }
+}
+
+enum Listener {
+    Tcp(TcpIncoming),
+    Unix(PathBuf, UnixListenerStream), // path needed to remove the socket file on exit
+}
+
+#[derive(Clone)]
+struct XTokenInterceptor {
+    x_token: Option<AsciiMetadataValue>,
+}
+
+impl interceptor::Interceptor for XTokenInterceptor {
+    fn call(&mut self, request: Request<()>) -> Result<Request<()>, Status> {
+        if let Some(x_token) = &self.x_token {
+            match request.metadata().get("x-token") {
+                Some(token) if token == x_token => Ok(request),
+                _ => Err(Status::unauthenticated("No valid auth token")),
+            }
+        } else {
+            Ok(request)
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct GrpcService {
     config_snapshot_client_channel_capacity: usize,
     config_channel_capacity: usize,
     config_filter_limits: Arc<FilterLimits>,
-    blocks_meta: Option<BlockMetaStorage>,
-    subscribe_id: AtomicUsize,
-    snapshot_rx: Mutex<Option<crossbeam_channel::Receiver<Box<Message>>>>,
+    subscription_limit: usize,
+    subscription_limit_enforce: bool,
+    subscription_tracker: SubscriptionTracker,
+    blocks_meta: Option<Arc<BlockMetaStorage>>,
+    subscribe_id: Arc<AtomicUsize>,
+    snapshot_rx: Arc<Mutex<Option<crossbeam_channel::Receiver<Box<Message>>>>>,
     broadcast_tx: broadcast::Sender<BroadcastedMessage>,
     replay_stored_slots_tx: Option<mpsc::Sender<ReplayStoredSlotsRequest>>,
     replay_first_available_slot: Option<Arc<AtomicU64>>,
@@ -415,14 +545,40 @@ impl GrpcService {
         is_reload: bool,
         service_cancellation_token: CancellationToken,
         task_tracker: TaskTracker,
+        parallel_encoder: ParallelEncoder,
     ) -> anyhow::Result<(
         Option<crossbeam_channel::Sender<Box<Message>>>,
         mpsc::UnboundedSender<Message>,
     )> {
-        // Bind service address
-        let incoming = TcpIncoming::bind(config.address)?
-            .with_nodelay(Some(true))
-            .with_keepalive(Some(Duration::from_secs(20)));
+        // Bind all configured addresses (TCP or Unix domain socket)
+        let mut listeners = Vec::new();
+        for addr in &config.address.inner {
+            let listener = match addr {
+                GrpcAddress::Tcp(addr) => {
+                    let incoming = TcpIncoming::bind(*addr)?
+                        .with_nodelay(Some(true))
+                        .with_keepalive(Some(Duration::from_secs(20)));
+                    Listener::Tcp(incoming)
+                }
+                GrpcAddress::Unix { path, mode } => {
+                    if config.tls_config.is_some() {
+                        log::warn!(
+                            "TLS config is ignored for Unix domain socket: {}",
+                            path.display()
+                        );
+                    }
+                    if let Err(e) = std::fs::remove_file(path) {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            return Err(e.into());
+                        }
+                    }
+                    let uds = UnixListener::bind(path)?;
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(*mode))?;
+                    Listener::Unix(path.clone(), UnixListenerStream::new(uds))
+                }
+            };
+            listeners.push(listener);
+        }
 
         // Snapshot channel
         let (snapshot_tx, snapshot_rx) = match config.snapshot_plugin_channel_capacity {
@@ -447,7 +603,6 @@ impl GrpcService {
 
         // Messages to clients combined by commitment
         let (broadcast_tx, _) = broadcast::channel(config.channel_capacity);
-        // attempt to prevent spam of geyser loop with capacity eq 1
         let (replay_first_available_slot, replay_stored_slots_tx, replay_stored_slots_rx) =
             if config.replay_stored_slots == 0 {
                 (None, None, None)
@@ -456,34 +611,28 @@ impl GrpcService {
                 (Some(Arc::new(AtomicU64::new(u64::MAX))), Some(tx), Some(rx))
             };
 
-        // gRPC server builder with optional TLS
-        let mut server_builder = Server::builder();
-        if let Some(tls_config) = &config.tls_config {
-            let (cert, key) = tokio::try_join!(
-                fs::read(&tls_config.cert_path),
-                fs::read(&tls_config.key_path)
-            )
-            .context("failed to load tls_config files")?;
-            server_builder = server_builder
-                .tls_config(ServerTlsConfig::new().identity(Identity::from_pem(cert, key)))
-                .context("failed to apply tls_config")?;
-        }
-        if let Some(enabled) = config.server_http2_adaptive_window {
-            server_builder = server_builder.http2_adaptive_window(Some(enabled));
-        }
-        if let Some(http2_keepalive_interval) = config.server_http2_keepalive_interval {
-            server_builder =
-                server_builder.http2_keepalive_interval(Some(http2_keepalive_interval));
-        }
-        if let Some(http2_keepalive_timeout) = config.server_http2_keepalive_timeout {
-            server_builder = server_builder.http2_keepalive_timeout(Some(http2_keepalive_timeout));
-        }
-        if let Some(sz) = config.server_initial_connection_window_size {
-            server_builder = server_builder.initial_connection_window_size(sz);
-        }
-        if let Some(sz) = config.server_initial_stream_window_size {
-            server_builder = server_builder.initial_stream_window_size(sz);
-        }
+        // Read TLS identity once (async, before per-listener loop)
+        let tls_identity = match &config.tls_config {
+            Some(tls) => {
+                let (cert, key) =
+                    tokio::try_join!(fs::read(&tls.cert_path), fs::read(&tls.key_path))
+                        .context("failed to load tls_config files")?;
+                Some(Identity::from_pem(cert, key))
+            }
+            None => None,
+        };
+
+        // Capture traffic reporting threshold before config is moved
+        let traffic_reporting_threshold = config
+            .traffic_reporting_byte_threhsold
+            .unwrap_or_else(|| ByteSize::b(DEFAULT_TRAFFIC_REPORTING_THRESHOLD));
+
+        // Save HTTP/2 settings (all Copy) for use inside spawned tasks
+        let http2_adaptive_window = config.server_http2_adaptive_window;
+        let http2_keepalive_interval = config.server_http2_keepalive_interval;
+        let http2_keepalive_timeout = config.server_http2_keepalive_timeout;
+        let initial_connection_window_size = config.server_initial_connection_window_size;
+        let initial_stream_window_size = config.server_initial_stream_window_size;
 
         let filter_names = Arc::new(Mutex::new(FilterNames::new(
             config.filter_name_size_limit,
@@ -491,15 +640,18 @@ impl GrpcService {
             config.filter_names_cleanup_interval,
         )));
 
-        // Create Server
+        // Build the shared GeyserServer (Clone-able because GrpcService: Clone)
         let max_decoding_message_size = config.max_decoding_message_size;
         let mut service = GeyserServer::new(Self {
             config_snapshot_client_channel_capacity: config.snapshot_client_channel_capacity,
             config_channel_capacity: config.channel_capacity,
             config_filter_limits: Arc::new(config.filter_limits),
-            blocks_meta,
-            subscribe_id: AtomicUsize::new(0),
-            snapshot_rx: Mutex::new(snapshot_rx),
+            subscription_limit: config.subscription_limit,
+            subscription_limit_enforce: config.subscription_limit_enforce,
+            subscription_tracker: Arc::new(StdMutex::new(HashMap::new())),
+            blocks_meta: blocks_meta.map(Arc::new),
+            subscribe_id: Arc::new(AtomicUsize::new(0)),
+            snapshot_rx: Arc::new(Mutex::new(snapshot_rx)),
             broadcast_tx: broadcast_tx.clone(),
             replay_stored_slots_tx,
             replay_first_available_slot: replay_first_available_slot.clone(),
@@ -526,36 +678,53 @@ impl GrpcService {
                 replay_stored_slots_rx,
                 replay_first_available_slot,
                 config.replay_stored_slots,
+                parallel_encoder,
             )
             .await;
         });
 
-        // Run Server
-        let shutdown_grpc = service_cancellation_token.child_token();
-        task_tracker.spawn(async move {
-            // gRPC Health check service
-            let (health_reporter, health_service) = health_reporter();
-            health_reporter.set_serving::<GeyserServer<Self>>().await;
+        // Health check service
+        let (health_reporter, health_service) = health_reporter();
+        health_reporter.set_serving::<GeyserServer<Self>>().await;
 
-            let result = server_builder
-                .layer(interceptor::InterceptorLayer::new(
-                    move |request: Request<()>| {
-                        if let Some(x_token) = &config.x_token {
-                            match request.metadata().get("x-token") {
-                                Some(token) if x_token == token => Ok(request),
-                                _ => Err(Status::unauthenticated("No valid auth token")),
-                            }
-                        } else {
-                            Ok(request)
-                        }
-                    },
-                ))
-                .add_service(health_service)
-                .add_service(service)
-                .serve_with_incoming_shutdown(incoming, shutdown_grpc.cancelled())
-                .await;
-            info!("gRPC server shut down with result: {result:?}");
-        });
+        let x_token = config
+            .x_token
+            .map(|t| t.parse::<AsciiMetadataValue>())
+            .transpose()
+            .context("invalid x_token value")?;
+
+        let shutdown_grpc = service_cancellation_token.child_token();
+
+        // Spawn one server task per listener
+        for listener in listeners {
+            let shutdown = shutdown_grpc.clone();
+            let tls_identity = tls_identity.clone();
+            let x_token = x_token.clone();
+            let health_service = health_service.clone();
+            let service = service.clone();
+
+            task_tracker.spawn(async move {
+                if let Err(e) = GrpcService::serve_listener(
+                    listener,
+                    tls_identity,
+                    http2_adaptive_window,
+                    http2_keepalive_interval,
+                    http2_keepalive_timeout,
+                    initial_connection_window_size,
+                    initial_stream_window_size,
+                    x_token,
+                    health_service,
+                    service,
+                    traffic_reporting_threshold,
+                    shutdown.clone(),
+                )
+                .await
+                {
+                    error!("gRPC listener failed: {e}");
+                    shutdown.cancel();
+                }
+            });
+        }
 
         Ok((snapshot_tx, messages_tx))
     }
@@ -567,6 +736,7 @@ impl GrpcService {
         replay_stored_slots_rx: Option<mpsc::Receiver<ReplayStoredSlotsRequest>>,
         replay_first_available_slot: Option<Arc<AtomicU64>>,
         replay_stored_slots: u64,
+        parallel_encoder: ParallelEncoder,
     ) {
         const PROCESSED_MESSAGES_MAX: usize = 31;
         const PROCESSED_MESSAGES_SLEEP: Duration = Duration::from_millis(10);
@@ -811,8 +981,10 @@ impl GrpcService {
 
                             // processed
                             processed_messages.push(message.clone());
+                            GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
+                            let encoded = parallel_encoder.encode(processed_messages).await;
                             let _ =
-                                broadcast_tx.send((CommitmentLevel::Processed, processed_messages.into()));
+                                broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
                             processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
                             processed_sleep
                                 .as_mut()
@@ -850,8 +1022,10 @@ impl GrpcService {
                                 || !confirmed_messages.is_empty()
                                 || !finalized_messages.is_empty()
                             {
+                                GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
+                                let encoded = parallel_encoder.encode(processed_messages).await;
                                 let _ = broadcast_tx
-                                    .send((CommitmentLevel::Processed, processed_messages.into()));
+                                    .send((CommitmentLevel::Processed, encoded.into()));
                                 processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
                                 processed_sleep
                                     .as_mut()
@@ -872,7 +1046,9 @@ impl GrpcService {
                 }
                 () = &mut processed_sleep => {
                     if !processed_messages.is_empty() {
-                        let _ = broadcast_tx.send((CommitmentLevel::Processed, processed_messages.into()));
+                        GEYSER_BATCH_SIZE.observe(processed_messages.len() as f64);
+                        let encoded = parallel_encoder.encode(processed_messages).await;
+                        let _ = broadcast_tx.send((CommitmentLevel::Processed, encoded.into()));
                         processed_messages = Vec::with_capacity(PROCESSED_MESSAGES_MAX);
                     }
                     processed_sleep.as_mut().reset(Instant::now() + PROCESSED_MESSAGES_SLEEP);
@@ -917,37 +1093,31 @@ impl GrpcService {
         mut messages_rx: broadcast::Receiver<BroadcastedMessage>,
         replay_stored_slots_tx: Option<mpsc::Sender<ReplayStoredSlotsRequest>>,
         debug_client_tx: Option<mpsc::UnboundedSender<DebugClientMessage>>,
+        maybe_remote_peer_sk_addr: Option<SocketAddr>,
         cancellation_token: CancellationToken,
         task_tracker: TaskTracker,
+        subscription_tracker: SubscriptionTracker,
     ) {
-        let mut filter = Filter::default();
-
-        // Ensure cancellation_token is cancelled on exit even if we panic
-        let on_drop = OnDrop::new({
-            let cancellation_token = cancellation_token.clone();
-            move || {
-                cancellation_token.cancel();
-            }
-        });
-
-        metrics::update_subscriptions(&endpoint, None, Some(&filter));
-        let subscriber_id = subscriber_id.unwrap_or("UNKNOWN".to_owned());
-        metrics::connections_total_inc();
-        DebugClientMessage::maybe_send(&debug_client_tx, || DebugClientMessage::UpdateFilter {
+        let mut session = ClientSession::new(
             id,
-            filter: Box::new(filter.clone()),
-        });
-        info!("client #{id}: new");
+            subscriber_id,
+            endpoint,
+            maybe_remote_peer_sk_addr,
+            debug_client_tx,
+            cancellation_token,
+            subscription_tracker,
+        );
+        let cancellation_token = session.cancellation_token.clone();
 
         if let Some(snapshot_rx) = snapshot_rx.take() {
             info!("client #{id}: snapshot requested");
             let result = Self::client_loop_snapshot(
                 id,
-                &endpoint,
+                &session.endpoint,
                 stream_tx.clone(),
                 &mut client_rx,
                 snapshot_rx,
-                &mut filter,
+                &mut session.filter,
                 cancellation_token.clone(),
             )
             .await;
@@ -959,10 +1129,12 @@ impl GrpcService {
                     let _ = stream_tx.try_send(Err(Status::internal(
                         "server is shutting down try again later",
                     )));
+                    session.disconnect_reason = "server_shutdown";
                     return;
                 }
                 Err(ClientSnapshotReplayError::ClientGrpcConnectionClosed) => {
                     info!("client #{id}: grpc connection closed");
+                    session.disconnect_reason = "client_closed";
                     return;
                 }
             }
@@ -971,22 +1143,13 @@ impl GrpcService {
         }
 
         'outer: loop {
-            set_subscriber_send_bandwidth_load(
-                &subscriber_id,
-                stream_tx.estimated_send_rate().per_second() as i64,
-            );
-
-            set_subscriber_recv_bandwidth_load(
-                &subscriber_id,
-                stream_tx.estimated_consuming_rate().per_second() as i64,
-            );
-
-            set_subscriber_queue_size(&subscriber_id, stream_tx.queue_size());
+            set_subscriber_queue_size(&session.subscriber_id, stream_tx.queue_size());
 
             tokio::select! {
                 _ = cancellation_token.cancelled() => {
                     info!("client #{id}: cancelled");
                     let _ = stream_tx.try_send(Err(Status::unavailable("server is shutting down try again later")));
+                    session.disconnect_reason = "server_shutdown";
                     break 'outer;
                 }
                 mut message = client_rx.recv() => {
@@ -1006,9 +1169,7 @@ impl GrpcService {
 
                     match message {
                         Some(Some((from_slot, filter_new))) => {
-                            metrics::update_subscriptions(&endpoint, Some(&filter), Some(&filter_new));
-                            filter = filter_new;
-                            DebugClientMessage::maybe_send(&debug_client_tx, || DebugClientMessage::UpdateFilter { id, filter: Box::new(filter.clone()) });
+                            session.set_filter(filter_new);
                             info!("client #{id}: filter updated");
 
                             if let Some(from_slot) = from_slot {
@@ -1017,16 +1178,18 @@ impl GrpcService {
                                     task_tracker.spawn(async move {
                                         let _ = stream_tx.send(Err(Status::internal("from_slot is not supported"))).await;
                                     });
+                                    session.disconnect_reason = "from_slot_unsupported";
                                     break 'outer;
                                 };
 
                                 let (tx, rx) = oneshot::channel();
-                                let commitment = filter.get_commitment_level();
+                                let commitment = session.filter.get_commitment_level();
                                 if let Err(_error) = replay_stored_slots_tx.send((commitment, from_slot, tx)).await {
                                     error!("client #{id}: failed to send from_slot request");
                                     task_tracker.spawn(async move {
                                         let _ = stream_tx.send(Err(Status::internal("failed to send from_slot request"))).await;
                                     });
+                                    session.disconnect_reason = "replay_error";
                                     break 'outer;
                                 }
 
@@ -1040,6 +1203,7 @@ impl GrpcService {
                                             );
                                             let _ = stream_tx.send(Err(Status::internal(message))).await;
                                         });
+                                        session.disconnect_reason = "slot_unavailable";
                                         break 'outer;
                                     },
                                     Err(_error) => {
@@ -1047,21 +1211,23 @@ impl GrpcService {
                                         task_tracker.spawn(async move {
                                             let _ = stream_tx.send(Err(Status::internal("failed to get replay response"))).await;
                                         });
+                                        session.disconnect_reason = "replay_error";
                                         break 'outer;
                                     }
                                 };
 
                                 messages.sort_by_key(|msg| msg.0);
                                 for (_msgid, message) in messages.iter() {
-                                    for message in filter.get_updates(message, Some(commitment)) {
+                                    for message in session.filter.get_updates(message, Some(commitment)) {
                                         let proto_size = message.encoded_len().min(u32::MAX as usize) as u32;
                                         match stream_tx.send(Ok(message)).await {
                                             Ok(()) => {
-                                                metrics::incr_grpc_message_sent_counter(&subscriber_id);
-                                                metrics::incr_grpc_bytes_sent(&subscriber_id, proto_size);
+                                                metrics::incr_grpc_message_sent_counter(&session.subscriber_id);
+                                                metrics::incr_grpc_bytes_sent(&session.subscriber_id, proto_size);
                                             }
                                             Err(mpsc::error::SendError(_)) => {
                                                 error!("client #{id}: stream closed");
+                                                session.disconnect_reason = "client_closed";
                                                 break 'outer;
                                             }
                                         }
@@ -1070,9 +1236,11 @@ impl GrpcService {
                             }
                         }
                         Some(None) => {
+                            session.disconnect_reason = "client_disconnect";
                             break 'outer;
                         },
                         None => {
+                            session.disconnect_reason = "client_disconnect";
                             break 'outer;
                         }
                     }
@@ -1081,6 +1249,7 @@ impl GrpcService {
                     let (commitment, messages) = match message {
                         Ok((commitment, messages)) => (commitment, messages),
                         Err(broadcast::error::RecvError::Closed) => {
+                            session.disconnect_reason = "broadcast_closed";
                             break 'outer;
                         },
                         Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -1088,56 +1257,48 @@ impl GrpcService {
                             task_tracker.spawn(async move {
                                 let _ = stream_tx.send(Err(Status::internal("lagged to receive geyser messages"))).await;
                             });
+                            session.disconnect_reason = "client_broadcast_lag";
                             break 'outer;
                         }
                     };
 
-                    if commitment == filter.get_commitment_level() {
+                    if commitment == session.filter.get_commitment_level() {
                         for (_msgid, message) in messages.iter() {
-                            for message in filter.get_updates(message, Some(commitment)) {
+                            for message in session.filter.get_updates(message, Some(commitment)) {
                                 let proto_size = message.encoded_len().min(u32::MAX as usize) as u32;
                                 match stream_tx.try_send(Ok(message)) {
                                     Ok(()) => {
-                                        metrics::incr_grpc_message_sent_counter(&subscriber_id);
-                                        metrics::incr_grpc_bytes_sent(&subscriber_id, proto_size);
+                                        metrics::incr_grpc_message_sent_counter(&session.subscriber_id);
+                                        metrics::incr_grpc_bytes_sent(&session.subscriber_id, proto_size);
                                     }
                                     Err(mpsc::error::TrySendError::Full(_)) => {
                                         error!("client #{id}: lagged to send an update");
                                         task_tracker.spawn(async move {
                                             let _ = stream_tx.send(Err(Status::internal("lagged to send an update"))).await;
                                         });
+                                        session.disconnect_reason = "client_channel_full";
                                         break 'outer;
                                     }
                                     Err(mpsc::error::TrySendError::Closed(_)) => {
                                         error!("client #{id}: stream closed");
+                                        session.disconnect_reason = "client_closed";
                                         break 'outer;
                                     }
                                 }
                             }
                         }
-                    } else {
-                        stream_tx.no_load();
                     }
 
-                    if commitment == CommitmentLevel::Processed && debug_client_tx.is_some() {
+                    if commitment == CommitmentLevel::Processed && session.debug_client_tx.is_some() {
                         for message in messages.iter() {
                             if let Message::Slot(slot_message) = &message.1 {
-                                DebugClientMessage::maybe_send(&debug_client_tx, || DebugClientMessage::UpdateSlot { id, slot: slot_message.slot });
+                                DebugClientMessage::maybe_send(&session.debug_client_tx, || DebugClientMessage::UpdateSlot { id, slot: slot_message.slot });
                             }
                         }
                     }
                 }
             }
         }
-        set_subscriber_recv_bandwidth_load(&subscriber_id, 0);
-        set_subscriber_send_bandwidth_load(&subscriber_id, 0);
-        set_subscriber_queue_size(&subscriber_id, 0);
-
-        metrics::connections_total_dec();
-        DebugClientMessage::maybe_send(&debug_client_tx, || DebugClientMessage::Removed { id });
-        metrics::update_subscriptions(&endpoint, Some(&filter), None);
-        info!("client #{id}: removed");
-        drop(on_drop);
     }
 
     async fn client_loop_snapshot(
@@ -1216,18 +1377,163 @@ impl GrpcService {
 
         Ok(())
     }
+
+    async fn serve_listener<H>(
+        listener: Listener,
+        tls_identity: Option<Identity>,
+        http2_adaptive_window: Option<bool>,
+        http2_keepalive_interval: Option<Duration>,
+        http2_keepalive_timeout: Option<Duration>,
+        initial_connection_window_size: Option<u32>,
+        initial_stream_window_size: Option<u32>,
+        x_token: Option<AsciiMetadataValue>,
+        health_service: HealthServer<H>,
+        service: GeyserServer<GrpcService>,
+        traffic_reporting_threshold: ByteSize,
+        shutdown: CancellationToken,
+    ) -> anyhow::Result<()>
+    where
+        H: tonic_health::pb::health_server::Health,
+    {
+        let mut builder = Server::builder();
+
+        // TLS only applies to TCP — UDS is local IPC, no encryption needed
+        if matches!(listener, Listener::Tcp(_)) {
+            if let Some(identity) = tls_identity {
+                builder = builder
+                    .tls_config(ServerTlsConfig::new().identity(identity))
+                    .context("failed to apply tls_config")?;
+            }
+        }
+
+        if let Some(enabled) = http2_adaptive_window {
+            builder = builder.http2_adaptive_window(Some(enabled));
+        }
+        if let Some(interval) = http2_keepalive_interval {
+            builder = builder.http2_keepalive_interval(Some(interval));
+        }
+        if let Some(timeout) = http2_keepalive_timeout {
+            builder = builder.http2_keepalive_timeout(Some(timeout));
+        }
+        if let Some(sz) = initial_connection_window_size {
+            builder = builder.initial_connection_window_size(sz);
+        }
+        if let Some(sz) = initial_stream_window_size {
+            builder = builder.initial_stream_window_size(sz);
+        }
+
+        let router = builder
+            .layer(MeteredLayer::new())
+            .layer(interceptor::InterceptorLayer::new(XTokenInterceptor {
+                x_token,
+            }))
+            .add_service(health_service)
+            .add_service(service);
+
+        // Capture address before match consumes listener
+        let addr = match &listener {
+            Listener::Tcp(incoming) => incoming
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| "unknown".to_owned()),
+            Listener::Unix(path, _) => format!("unix://{}", path.display()),
+        };
+
+        info!("gRPC server listening on {addr}");
+
+        let result = match listener {
+            Listener::Tcp(incoming) => {
+                let spy = SpyIncoming::new(
+                    incoming,
+                    SpyIncomingConfig {
+                        traffic_reporting_threshold,
+                    },
+                );
+                router
+                    .serve_with_incoming_shutdown(spy, shutdown.cancelled())
+                    .await
+                    .context("TCP listener error")
+            }
+            Listener::Unix(path, incoming) => {
+                let result = router
+                    .serve_with_incoming_shutdown(incoming, shutdown.cancelled())
+                    .await
+                    .context("UDS listener error");
+
+                if let Err(e) = std::fs::remove_file(&path) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        log::warn!("failed to remove socket file {}: {e}", path.display());
+                    }
+                }
+                result
+            }
+        };
+
+        info!("gRPC server on {addr} shut down with result: {result:?}");
+        result
+    }
 }
 
 #[tonic::async_trait]
 impl Geyser for GrpcService {
     type SubscribeStream = LoadAwareReceiver<TonicResult<FilteredUpdate>>;
+    type SubscribeDeshredStream =
+        LoadAwareReceiver<TonicResult<yellowstone_grpc_proto::geyser::SubscribeUpdateDeshred>>;
 
     async fn subscribe(
         &self,
         mut request: Request<Streaming<SubscribeRequest>>,
     ) -> TonicResult<Response<Self::SubscribeStream>> {
-        let id = self.subscribe_id.fetch_add(1, Ordering::Relaxed);
+        incr_grpc_method_call_count("subscribe");
 
+        let subscriber_id = request
+            .metadata()
+            .get("x-subscription-id")
+            .and_then(|h| h.to_str().ok().map(|s| s.to_string()))
+            .or_else(|| request.remote_addr().map(|addr| addr.ip().to_string()));
+
+        // Per-subscriber subscription limit: check and increment under a
+        // single lock hold so no two calls can race past the limit.
+        // Cleanup (decrement) is handled by `ClientSession::drop()`.
+        // When subscriber_id is None (no x-subscription-id header and no
+        // remote address) we skip the limit check entirely rather than
+        // grouping all unidentified clients into a shared bucket.
+        if let Some(id) = subscriber_id.as_deref() {
+            if self.subscription_limit > 0 {
+                let mut tracker = self
+                    .subscription_tracker
+                    .lock()
+                    .expect("subscription_tracker mutex poisoned");
+                let count = tracker.entry(id.to_owned()).or_insert(0);
+
+                if *count >= self.subscription_limit {
+                    subscription_limit_exceeded_inc(id);
+                    if self.subscription_limit_enforce {
+                        return Err(Status::resource_exhausted(
+                            "max subscription limit exceeded",
+                        ));
+                    }
+                    info!(
+                        "subscriber {id:?} over limit ({count}/{}), not enforcing",
+                        self.subscription_limit
+                    );
+                }
+                *count += 1;
+            }
+        }
+
+        let maybe_remote_peer_sk_addr = request
+            .extensions()
+            .get::<TcpConnectInfo>()
+            .or_else(|| {
+                request
+                    .extensions()
+                    .get::<TlsConnectInfo<TcpConnectInfo>>()
+                    .map(|tls_info| tls_info.get_ref())
+            })
+            .and_then(|info| info.remote_addr());
+
+        let id = self.subscribe_id.fetch_add(1, Ordering::Relaxed);
         let client_cancellation_token = self.cancellation_token.child_token();
         if client_cancellation_token.is_cancelled() {
             return Err(Status::unavailable("server is shutting down"));
@@ -1240,41 +1546,39 @@ impl Geyser for GrpcService {
             None
         };
 
-        let client_stats_settings = StatsSettings::default()
-            .tx_ema_reactivity(EmaReactivity::Reactive)
-            .tx_ema_window(DEFAULT_EMA_WINDOW)
-            .rx_ema_reactivity(EmaReactivity::Reactive)
-            .rx_ema_window(DEFAULT_EMA_WINDOW);
-
-        let (stream_tx, stream_rx) = load_aware_channel(
-            if snapshot_rx.is_some() {
-                self.config_snapshot_client_channel_capacity
-            } else {
-                self.config_channel_capacity
-            },
-            client_stats_settings,
-        );
+        let (stream_tx, stream_rx) = load_aware_channel(if snapshot_rx.is_some() {
+            self.config_snapshot_client_channel_capacity
+        } else {
+            self.config_channel_capacity
+        });
         let (client_tx, client_rx) = mpsc::unbounded_channel();
 
         let ping_stream_tx = stream_tx.clone();
-        let ping_client_tx = client_tx.clone();
-        let ping_cancellation_token = client_cancellation_token.child_token();
+        let ping_cancellation_token = client_cancellation_token.clone();
+        let ping_client_cancel = client_cancellation_token.clone();
         self.task_tracker.spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
                 tokio::select! {
                     _ = ping_cancellation_token.cancelled() => {
                         info!("client #{id}: ping cancelled");
                         break;
                     }
-                    _ = sleep(Duration::from_secs(10)) => {
+                    _ = interval.tick() => {
                         let msg = FilteredUpdate::new_empty(FilteredUpdateOneof::ping());
-                        match ping_stream_tx.try_send(Ok(msg)) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(_)) => {}
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                let _ = ping_client_tx.send(None);
-                                break;
-                            }
+                        log::info!("client #{id}: sending ping");
+                        if ping_stream_tx.send(Ok(msg)).await.is_err() {
+                            //
+                            // It's really important to send cancel ping for one edge-case where someone
+                            // subscribe without any filter:
+                            //
+                            // When someone subscribe without any filter, this can create a "zombie" client loop that
+                            // does reject every geyser event thus we never write to the HTTP/2 stream and we never detect that the client TCP connection is closed.
+                            // By sending a ping every 10 seconds, we can detect if the client is still alive and if it's not,
+                            // we can cancel the client loop.
+                            ping_client_cancel.cancel();
+                            info!("detected dead client #{id}");
+                            break;
                         }
                     }
                 }
@@ -1287,12 +1591,6 @@ impl Geyser for GrpcService {
             .get("x-endpoint")
             .and_then(|h| h.to_str().ok().map(|s| s.to_string()))
             .unwrap_or_else(|| "".to_owned());
-
-        let subscriber_id = request
-            .metadata()
-            .get("x-subscription-id")
-            .and_then(|h| h.to_str().ok().map(|s| s.to_string()))
-            .or(request.remote_addr().map(|addr| addr.ip().to_string()));
 
         let config_filter_limits = Arc::clone(&self.config_filter_limits);
         let filter_names = Arc::clone(&self.filter_names);
@@ -1338,6 +1636,10 @@ impl Geyser for GrpcService {
                             }
                         }
                         Ok(None) => {
+                             // Client half-closed its send stream. Stop reading, but keep
+                             // incoming_client_tx alive so client_loop continues running.
+                            info!("client #{id}: client closed send stream, waiting for cancellation");
+                            incoming_cancellation_token.cancelled().await;
                             break;
                         }
                         Err(_error) => {
@@ -1359,17 +1661,30 @@ impl Geyser for GrpcService {
             self.broadcast_tx.subscribe(),
             self.replay_stored_slots_tx.clone(),
             self.debug_clients_tx.clone(),
+            maybe_remote_peer_sk_addr,
             client_cancellation_token,
             self.task_tracker.clone(),
+            Arc::clone(&self.subscription_tracker),
         ));
 
         Ok(Response::new(stream_rx))
+    }
+
+    async fn subscribe_deshred(
+        &self,
+        _request: Request<Streaming<SubscribeDeshredRequest>>,
+    ) -> TonicResult<Response<Self::SubscribeDeshredStream>> {
+        incr_grpc_method_call_count("subscribe_deshred");
+        Err(Status::unimplemented(
+            "SubscribeDeshred is not available on this server",
+        ))
     }
 
     async fn subscribe_first_available_slot(
         &self,
         _request: Request<SubscribeReplayInfoRequest>,
     ) -> Result<Response<SubscribeReplayInfoResponse>, Status> {
+        incr_grpc_method_call_count("subscribe_first_available_slot");
         let response = SubscribeReplayInfoResponse {
             first_available: self
                 .replay_first_available_slot
@@ -1380,6 +1695,7 @@ impl Geyser for GrpcService {
     }
 
     async fn ping(&self, request: Request<PingRequest>) -> Result<Response<PongResponse>, Status> {
+        incr_grpc_method_call_count("ping");
         let count = request.get_ref().count;
         let response = PongResponse { count };
         Ok(Response::new(response))
@@ -1389,6 +1705,7 @@ impl Geyser for GrpcService {
         &self,
         request: Request<GetLatestBlockhashRequest>,
     ) -> Result<Response<GetLatestBlockhashResponse>, Status> {
+        incr_grpc_method_call_count("get_latest_blockhash");
         if let Some(blocks_meta) = &self.blocks_meta {
             blocks_meta
                 .get_block(
@@ -1412,6 +1729,7 @@ impl Geyser for GrpcService {
         &self,
         request: Request<GetBlockHeightRequest>,
     ) -> Result<Response<GetBlockHeightResponse>, Status> {
+        incr_grpc_method_call_count("get_block_height");
         if let Some(blocks_meta) = &self.blocks_meta {
             blocks_meta
                 .get_block(
@@ -1432,6 +1750,7 @@ impl Geyser for GrpcService {
         &self,
         request: Request<GetSlotRequest>,
     ) -> Result<Response<GetSlotResponse>, Status> {
+        incr_grpc_method_call_count("get_slot");
         if let Some(blocks_meta) = &self.blocks_meta {
             blocks_meta
                 .get_block(
@@ -1448,6 +1767,7 @@ impl Geyser for GrpcService {
         &self,
         request: Request<IsBlockhashValidRequest>,
     ) -> Result<Response<IsBlockhashValidResponse>, Status> {
+        incr_grpc_method_call_count("is_blockhash_valid");
         if let Some(blocks_meta) = &self.blocks_meta {
             let req = request.get_ref();
             blocks_meta
@@ -1462,8 +1782,191 @@ impl Geyser for GrpcService {
         &self,
         _request: Request<GetVersionRequest>,
     ) -> Result<Response<GetVersionResponse>, Status> {
+        incr_grpc_method_call_count("get_version");
         Ok(Response::new(GetVersionResponse {
             version: serde_json::to_string(&GrpcVersionInfo::default()).unwrap(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        crate::{
+            plugin::filter::{limits::FilterLimits, name::FilterNames, Filter},
+            util::stream::load_aware_channel,
+        },
+        yellowstone_grpc_proto::prelude::{SubscribeRequest, SubscribeRequestFilterSlots},
+    };
+
+    fn create_filter_with_slots() -> Filter {
+        let config = SubscribeRequest {
+            slots: HashMap::from([("test".into(), SubscribeRequestFilterSlots::default())]),
+            ..Default::default()
+        };
+        let mut names = FilterNames::new(64, 1024, Duration::from_secs(1));
+        Filter::new(&config, &FilterLimits::default(), &mut names).unwrap()
+    }
+
+    // Simulates the incoming handler task from subscribe(). Mirrors the
+    // real Ok(None) path: sends the filter, then on half-close awaits
+    // cancellation to keep the sender alive.
+    async fn incoming_handler(
+        client_tx: mpsc::UnboundedSender<Option<(Option<u64>, Filter)>>,
+        filter: Filter,
+        half_close: oneshot::Receiver<()>,
+        ct: CancellationToken,
+    ) {
+        client_tx.send(Some((None, filter))).unwrap();
+        let _ = half_close.await;
+        // this is the fix from #670: await cancellation instead of
+        // breaking, so client_tx stays alive and client_rx remains open.
+        ct.cancelled().await;
+    }
+
+    // Regression test for #662 / #670.
+    //
+    // #662 (91709fd) removed ping_client_tx, the clone of client_tx that
+    // lived in the ping task. before that patch two senders existed for
+    // client_rx: ping_client_tx and incoming_client_tx. when a client
+    // half-closed its send stream (Ok(None)), the incoming task dropped its
+    // sender but ping_client_tx kept client_rx open so client_loop survived.
+    //
+    // after #662 incoming_client_tx is the only sender. without the fix from
+    // #670 (awaiting cancellation in the Ok(None) handler instead of
+    // breaking), dropping it closes client_rx and tears down the connection
+    // on a normal grpc half-close.
+    //
+    // uses current_thread runtime so yield_now deterministically sequences
+    // filter processing before any broadcast.
+    #[tokio::test]
+    async fn test_cancellation_on_client_disconnect_after_half_close() {
+        let ct = CancellationToken::new();
+        let tt = TaskTracker::new();
+        let st: SubscriptionTracker = Arc::new(StdMutex::new(HashMap::new()));
+        let (broadcast_tx, _) = broadcast::channel::<BroadcastedMessage>(16);
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (stream_tx, stream_rx) = load_aware_channel(16);
+        let (half_close_tx, half_close_rx) = oneshot::channel();
+
+        // mirrors the incoming handler spawned in subscribe()
+        let incoming_ct = ct.child_token();
+        tokio::spawn(incoming_handler(
+            client_tx,
+            create_filter_with_slots(),
+            half_close_rx,
+            incoming_ct,
+        ));
+
+        let handle = tokio::spawn(GrpcService::client_loop(
+            0,
+            Some("test".into()),
+            "test".into(),
+            stream_tx,
+            client_rx,
+            None,
+            broadcast_tx.subscribe(),
+            None,
+            None,
+            None,
+            ct.clone(),
+            tt.clone(),
+            Arc::clone(&st),
+        ));
+
+        // yield so incoming_handler sends the filter and client_loop
+        // processes it (only client_rx is ready, no broadcast yet)
+        tokio::task::yield_now().await;
+
+        // client half-closes its send stream
+        let _ = half_close_tx.send(());
+        tokio::task::yield_now().await;
+
+        // client drops subscription rx
+        drop(stream_rx);
+
+        // broadcast so client_loop hits try_send -> Closed
+        let msg = Message::Slot(MessageSlot {
+            slot: 100,
+            parent: Some(99),
+            status: SlotStatus::Processed,
+            dead_error: None,
+            created_at: Timestamp::from(SystemTime::now()),
+        });
+        let _ = broadcast_tx.send((CommitmentLevel::Processed, Arc::new(vec![(1, msg)])));
+
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("client_loop did not exit")
+            .expect("client_loop panicked");
+
+        assert!(ct.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_subscription_tracker_decrements_on_session_drop() {
+        let tracker: SubscriptionTracker = Arc::new(StdMutex::new(HashMap::new()));
+
+        // simulate what subscribe() does: increment under lock
+        {
+            let mut map = tracker.lock().unwrap();
+            *map.entry("sub-1".to_owned()).or_insert(0) += 1;
+            *map.entry("sub-1".to_owned()).or_insert(0) += 1;
+        }
+        assert_eq!(*tracker.lock().unwrap().get("sub-1").unwrap(), 2);
+
+        // create a session (mirrors what client_loop does)
+        {
+            let _session = ClientSession::new(
+                0,
+                Some("sub-1".into()),
+                "".into(),
+                None,
+                None,
+                CancellationToken::new(),
+                Arc::clone(&tracker),
+            );
+            // session alive: count unchanged
+            assert_eq!(*tracker.lock().unwrap().get("sub-1").unwrap(), 2);
+        }
+        // session dropped: count decremented
+        assert_eq!(*tracker.lock().unwrap().get("sub-1").unwrap(), 1);
+
+        // second drop removes the entry entirely
+        {
+            let _session = ClientSession::new(
+                1,
+                Some("sub-1".into()),
+                "".into(),
+                None,
+                None,
+                CancellationToken::new(),
+                Arc::clone(&tracker),
+            );
+        }
+        assert!(tracker.lock().unwrap().get("sub-1").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_subscription_tracker_skips_unidentified_subscribers() {
+        let tracker: SubscriptionTracker = Arc::new(StdMutex::new(HashMap::new()));
+
+        // subscriber_id=None resolves to "UNKNOWN" inside ClientSession,
+        // but subscribe() skips the limit check entirely for None.
+        // The tracker should remain empty since no increment happened.
+        {
+            let _session = ClientSession::new(
+                0,
+                None,
+                "".into(),
+                None,
+                None,
+                CancellationToken::new(),
+                Arc::clone(&tracker),
+            );
+        }
+        // drop fires but "UNKNOWN" was never in the tracker, so nothing changes
+        assert!(tracker.lock().unwrap().is_empty());
     }
 }

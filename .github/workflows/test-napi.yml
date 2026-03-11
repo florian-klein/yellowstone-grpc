@@ -1,20 +1,14 @@
 ---
-name: Yellowstone GRPC Test
+name: Napi test
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 on:
   pull_request:
-  push:
-    branches:
-      - 'master'
-      - 'v1.16'
-      - 'v1.17'
-      - 'v1.18'
-      - 'v2.0'
-      - 'v2.1'
-      - 'v2.2'
+    paths:
+      - 'yellowstone-grpc-client-nodejs/napi/**'
+      - '.github/workflows/test-napi.yml'
   workflow_dispatch:
 
 env:
@@ -27,11 +21,6 @@ jobs:
         os: [ubuntu-22.04]
     runs-on: ["${{ matrix.os }}"]
     steps:
-      - name: baseline
-        run: |
-          free -h
-          df -h
-
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
@@ -74,49 +63,23 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libsasl2-dev protobuf-compiler
 
-      - name: post install
+      - name: post isntall
         run: |
           free -h
           df -h
 
-      - uses: actions/cache@v4
-        with:
-          path: |
-              ~/.cargo/bin/
-              ~/.cargo/registry/index/
-              ~/.cargo/registry/cache/
-              ~/.cargo/git/db/
-              ./target
-          key: v0001-${{ matrix.os }}-rust-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            v0001-${{ matrix.os }}-rust-${{ hashFiles('rust-toolchain.toml') }}
-
-      - name: cargo tree
+      - name: cargo tree napi
         run: |
+          cd yellowstone-grpc-client-nodejs/napi
           cargo tree
           git diff Cargo.lock
           git checkout Cargo.lock
           cargo tree --frozen
 
-      - name: cargo fmt
-        run: cargo +nightly fmt --all -- --check
+      - name: cargo fmt napi
+        run: |
+          cd yellowstone-grpc-client-nodejs/napi
+          cargo +nightly fmt --all -- --check
 
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets
-
-      - name: check features in `client`
-        run: cargo check -p yellowstone-grpc-client --all-targets
-      - name: check features in `client-simple`
-        run: cargo check -p yellowstone-grpc-client-simple --all-targets
-      - name: check features in `geyser`
-        run: cargo check -p yellowstone-grpc-geyser --all-targets
-      - name: check features in `proto`
-        run: cargo check -p yellowstone-grpc-proto --all-targets
-      - name: check all features in `proto`
-        run: cargo check -p yellowstone-grpc-proto --all-targets --all-features
-
-      - name: cargo test
-        run: cargo test --all-features
-
-      - name: Build
-        run: ./ci/cargo-build-test.sh
+      - name: cargo clippy napi
+        run: make solana-encoding-napi-clippy
