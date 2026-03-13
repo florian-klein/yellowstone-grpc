@@ -78,7 +78,7 @@ impl GeyserPlugin for Plugin {
         let config = Config::load_from_file(config_file)?;
 
         // Setup logger
-        solana_logger::setup_with_default(&config.log.level);
+        agave_logger::setup_with_default(&config.log.level);
 
         log::info!("loading plugin: {}", self.name());
 

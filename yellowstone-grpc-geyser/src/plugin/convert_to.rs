@@ -7,7 +7,7 @@ use {
     solana_pubkey::Pubkey,
     solana_signature::Signature,
     solana_transaction::versioned::VersionedTransaction,
-    solana_transaction_context::TransactionReturnData,
+    solana_transaction_context::transaction::TransactionReturnData,
     solana_transaction_error::TransactionError,
     solana_transaction_status::{
         InnerInstruction, InnerInstructions, Reward, RewardType, TransactionStatusMeta,
@@ -45,6 +45,8 @@ pub fn create_message(message: &VersionedMessage) -> proto::Message {
             versioned: true,
             address_table_lookups: create_lookups(&message.address_table_lookups),
         },
+        // V1 (Alpenglow) messages not yet supported in geyser proto encoding
+        VersionedMessage::V1(_) => unimplemented!("V1 (Alpenglow) messages not yet supported"),
     }
 }
 
