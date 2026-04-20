@@ -188,6 +188,12 @@ impl GeyserPlugin for Plugin {
         slot: u64,
         is_startup: bool,
     ) -> PluginResult<()> {
+        {
+            static C: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if C.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 100000 == 0 {
+                log::warn!("update_account called, slot={} is_startup={}", slot, is_startup);
+            }
+        }
         self.with_inner(|inner| {
             let account = match account {
                 ReplicaAccountInfoVersions::V0_0_1(_info) => {
@@ -308,7 +314,7 @@ impl GeyserPlugin for Plugin {
     }
 
     fn account_data_notifications_enabled(&self) -> bool {
-        false
+        true
     }
 
     fn account_data_snapshot_notifications_enabled(&self) -> bool {
