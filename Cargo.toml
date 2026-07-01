@@ -79,17 +79,23 @@ solana-storage-proto = { path = "/home/solana/agave/storage-proto", features = [
 solana-transaction-context = { path = "/home/solana/agave/transaction-context", features = ["agave-unstable-api"] }
 solana-transaction-status = { path = "/home/solana/agave/transaction-status" }
 
-# Solana SDK (versions matched to agave 4.1.0-alpha.0 dependency tree)
-solana-account = "4.1.0"
-solana-clock = "3.0.1"
-solana-hash = "4.2.0"
+# Solana SDK (EXACT versions locked to agave 4.2.0-alpha.0's Cargo.lock).
+# These crates' types (SanitizedTransaction, Message, TransactionError, Pubkey,
+# Signature, AccountSharedData, Hash, Clock) cross the geyser plugin boundary by
+# reference: the validator constructs them, the plugin reads them. `agave-unstable-api`
+# gives no ABI stability, so a version skew here silently corrupts field offsets and
+# SIGSEGVs in the notify path (e.g. Filter::get_updates). Pin `=` so a `cargo update`
+# fails loudly instead of floating past agave. Keep in lockstep with agave's Cargo.lock.
+solana-account = "=4.3.1"
+solana-clock = "=3.1.1"
+solana-hash = "=4.4.0"
 solana-keypair = "3.1.2"
-solana-message = "4.1.0"
-solana-pubkey = "4.2.0"
-solana-signature = "3.3.0"
+solana-message = "=4.2.3"
+solana-pubkey = "=4.2.0"
+solana-signature = "=3.4.1"
 solana-signer = "3.0.0"
-solana-transaction = "4.1.0"
-solana-transaction-error = "3.2.0"
+solana-transaction = "=4.1.4"
+solana-transaction-error = "=3.3.0"
 
 # Solana Misc
 spl-token-2022-interface = "2.1.0"
