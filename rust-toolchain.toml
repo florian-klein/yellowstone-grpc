@@ -1,0 +1,5 @@
+[toolchain]
+# Must match agave's rust-toolchain.toml (/home/solana/agave/rust-toolchain.toml).
+# The geyser .so and the validator load the same `dyn GeyserPlugin` vtable; Rust
+# has no stable ABI, so a toolchain mismatch silently corrupts plugin calls.
+channel = "1.96.0"
